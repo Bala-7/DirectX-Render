@@ -950,7 +950,6 @@ int Run(HINSTANCE instance, int showCommand)
     }
 
     ShowWindow(window, showCommand);
-
     RECT initialClientRect{};
     GetClientRect(window, &initialClientRect);
     UINT sceneRenderWidth = static_cast<UINT>((std::max)(1L, initialClientRect.right - initialClientRect.left));
@@ -1019,6 +1018,42 @@ int Run(HINSTANCE instance, int showCommand)
             &device,
             &createdFeatureLevel,
             &context);
+    }
+
+    if (result == DXGI_ERROR_SDK_COMPONENT_MISSING && (deviceFlags & D3D11_CREATE_DEVICE_DEBUG) != 0)
+    {
+        deviceFlags &= ~D3D11_CREATE_DEVICE_DEBUG;
+        result = D3D11CreateDeviceAndSwapChain(
+            nullptr,
+            D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
+            deviceFlags,
+            featureLevels,
+            static_cast<UINT>(sizeof(featureLevels) / sizeof(featureLevels[0])),
+            D3D11_SDK_VERSION,
+            &swapChainDesc,
+            &swapChain,
+            &device,
+            &createdFeatureLevel,
+            &context);
+
+        if (result == E_INVALIDARG)
+        {
+            D3D_FEATURE_LEVEL fallbackFeatureLevels[] = {D3D_FEATURE_LEVEL_11_0};
+            result = D3D11CreateDeviceAndSwapChain(
+                nullptr,
+                D3D_DRIVER_TYPE_HARDWARE,
+                nullptr,
+                deviceFlags,
+                fallbackFeatureLevels,
+                static_cast<UINT>(sizeof(fallbackFeatureLevels) / sizeof(fallbackFeatureLevels[0])),
+                D3D11_SDK_VERSION,
+                &swapChainDesc,
+                &swapChain,
+                &device,
+                &createdFeatureLevel,
+                &context);
+        }
     }
 
     if (FAILED(result))

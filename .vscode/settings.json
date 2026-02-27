@@ -1,0 +1,13 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "Test-Path": true,
+        "&": true
+    },
+    "cmake.sourceDirectory": "${workspaceFolder}",
+    "cmake.buildDirectory": "${workspaceFolder}/build",
+    "cmake.generator": "Visual Studio 17 2022",
+    "cmake.configureSettings": {
+        "CMAKE_GENERATOR_PLATFORM": "x64"
+    },
+    "cmake.configureOnOpen": true
+}
