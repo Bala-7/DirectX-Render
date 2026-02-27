@@ -1,0 +1,23 @@
+site_name: RenderTest AI Documentation
+site_description: Static docs site for the AI-Documented feature docs
+docs_dir: AI-Documented
+site_dir: site
+use_directory_urls: false
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.tracking
+plugins:
+  - search
+nav:
+  - Home: README.md
+  - Editor: editor/index.md
+  - Scene: scene/index.md
+  - Lighting: lights/index.md
+  - Shadows: shadows/index.md
+  - Rendering: rendering/index.md
+  - Environment: environment/index.md
