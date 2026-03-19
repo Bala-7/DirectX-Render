@@ -41,7 +41,6 @@ constexpr UINT kMsaaSampleCount = 8;
 constexpr float kMoveSpeed = 3.0f;
 constexpr float kLookSensitivity = 0.0025f;
 constexpr float kMaxPitch = 1.4f;
-constexpr wchar_t kFaceTexturePath[] = L"cage.jpg";
 constexpr wchar_t kSkyboxDirectory0[] = L"Assets/Images/Skybox/Daylight";
 constexpr wchar_t kSkyboxDirectory1[] = L"../Assets/Images/Skybox/Daylight";
 constexpr wchar_t kSkyboxDirectory2[] = L"../../Assets/Images/Skybox/Daylight";
@@ -2157,11 +2156,6 @@ int Run(HINSTANCE instance, int showCommand)
     groundPlane.SetUsesTexture(false);
     groundPlane.SetCastsShadow(false);
 
-    GameObject& spinningCube = sceneGraph.CreateGameObject("SpinningCube", MeshType::Cube, groundPlane.GetId());
-    spinningCube.SetMaterialColor(XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f));
-    spinningCube.SetUsesTexture(true);
-    spinningCube.SetPosition(XMFLOAT3(0.0f, 0.0f, 0.0f));
-
     std::vector<ModelResource> loadedModels;
     auto getModelById = [&](std::uint32_t modelId) -> const ModelResource*
     {
@@ -2264,17 +2258,6 @@ int Run(HINSTANCE instance, int showCommand)
     result = device->CreateBuffer(&skyboxFrameBufferDesc, nullptr, &skyboxFrameBuffer);
     if (FAILED(result))
     {
-        if (shouldUninitializeCom)
-        {
-            CoUninitialize();
-        }
-        return -1;
-    }
-
-    ComPtr<ID3D11ShaderResourceView> faceTexture;
-    if (!LoadTextureFromFile(device.Get(), kFaceTexturePath, faceTexture))
-    {
-        MessageBoxA(window, "Could not load cage.jpg from the working directory.", "Texture Load Error", MB_OK | MB_ICONERROR);
         if (shouldUninitializeCom)
         {
             CoUninitialize();
@@ -2815,6 +2798,16 @@ int Run(HINSTANCE instance, int showCommand)
                 uiChanged = true;
             }
 
+            if (ImGui::SliderAngle("Directional Yaw", &directionalYaw, -180.0f, 180.0f))
+            {
+                uiChanged = true;
+            }
+
+            if (ImGui::SliderAngle("Directional Pitch", &directionalPitch, -80.0f, 80.0f))
+            {
+                uiChanged = true;
+            }
+
             ImGui::SliderFloat("Directional Intensity", &directionalIntensity, 0.0f, 2.0f, "%.2f");
             ImGui::SliderFloat3("Directional Color", &directionalColor.x, 0.0f, 2.0f, "%.2f");
             ImGui::Text("Shadow Debug Mode: %d", shadowDebugMode);
@@ -3070,11 +3063,6 @@ int Run(HINSTANCE instance, int showCommand)
         const XMMATRIX lightView2 = XMMatrixLookAtLH(directionalLightPosition, directionalLightTarget, worldUp);
         const XMMATRIX lightViewProjection2 = lightView2 * directionalLightProjection;
 
-        if (GameObject* cubeObject = sceneGraph.GetById(spinningCube.GetId()))
-        {
-            cubeObject->SetRotation(XMFLOAT3(0.0f, elapsedSeconds, 0.0f));
-        }
-
         std::vector<RenderItem> renderItems;
         renderItems.reserve(sceneGraph.GetObjects().size());
 
@@ -3255,7 +3243,7 @@ int Run(HINSTANCE instance, int showCommand)
         context->PSSetConstantBuffers(0, 1, frameBuffer.GetAddressOf());
 
         ID3D11ShaderResourceView* sceneSrvs[] = {
-            faceTexture.Get(),
+            nullptr,
             shadowShaderViews[0].Get(),
             shadowShaderViews[1].Get(),
             shadowShaderViews[2].Get()};
@@ -3283,7 +3271,7 @@ int Run(HINSTANCE instance, int showCommand)
                     objectData.materialParams = XMFLOAT4(mesh.hasTexture ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
 
                     ID3D11ShaderResourceView* drawSrvs[] = {
-                        mesh.hasTexture && mesh.texture ? mesh.texture.Get() : faceTexture.Get(),
+                        mesh.hasTexture && mesh.texture ? mesh.texture.Get() : nullptr,
                         shadowShaderViews[0].Get(),
                         shadowShaderViews[1].Get(),
                         shadowShaderViews[2].Get()};
