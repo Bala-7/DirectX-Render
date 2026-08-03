@@ -21,6 +21,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <commdlg.h>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 
 #include <wrl/client.h>
 
@@ -402,6 +406,14 @@ public:
     const std::vector<GameObject>& GetObjects() const
     {
         return m_objects;
+    }
+
+    void Clear()
+    {
+        m_objects.clear();
+        m_indexById.clear();
+        m_rootIds.clear();
+        m_nextId = 1;
     }
 
 private:
@@ -2965,6 +2977,7 @@ int Run(HINSTANCE instance, int showCommand)
 
     const auto startTime = std::chrono::steady_clock::now();
     auto previousFrameTime = startTime;
+    float smoothedFps = 0.0f;
     int shadowDebugMode = 0;
     bool debugToggleWasDown = false;
     bool wasCapturingMouseLook = false;
@@ -2983,6 +2996,238 @@ int Run(HINSTANCE instance, int showCommand)
     std::vector<RuntimePointLight> runtimePointLights;
     float editorInspectorPanelRatio = 0.24f;
     std::uint32_t selectedGameObjectId = groundPlane.GetId();
+    std::string currentScenePath;
+
+    auto showSaveDialog = [window]() -> std::string
+    {
+        char fileName[MAX_PATH]{};
+        OPENFILENAMEA ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner   = window;
+        ofn.lpstrFilter = "Scene Files\0*.scene\0All Files\0*.*\0";
+        ofn.lpstrFile   = fileName;
+        ofn.nMaxFile    = MAX_PATH;
+        ofn.lpstrDefExt = "scene";
+        ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+        return GetSaveFileNameA(&ofn) ? std::string(fileName) : std::string{};
+    };
+
+    auto showOpenDialog = [window]() -> std::string
+    {
+        char fileName[MAX_PATH]{};
+        OPENFILENAMEA ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner   = window;
+        ofn.lpstrFilter = "Scene Files\0*.scene\0All Files\0*.*\0";
+        ofn.lpstrFile   = fileName;
+        ofn.nMaxFile    = MAX_PATH;
+        ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        return GetOpenFileNameA(&ofn) ? std::string(fileName) : std::string{};
+    };
+
+    auto newScene = [&]()
+    {
+        sceneGraph.Clear();
+        selectedGameObjectId = 0;
+        currentScenePath.clear();
+        runtimePointLights.clear();
+        directionalYaw        = XMConvertToRadians(-74.0f);
+        directionalPitch      = XMConvertToRadians(-53.0f);
+        directionalColor      = {1.0f, 1.0f, 1.0f};
+        directionalIntensity  = 0.9f;
+        runtimeAmbientTerm       = 1.0f;
+        runtimeShadowDarkness    = 0.5f;
+        runtimePcssEnabled       = true;
+        runtimePcssSearchRadius  = 0.0016f;
+        runtimePcssMaxFilterRadius = 0.05f;
+    };
+
+    auto saveScene = [&](const std::string& path)
+    {
+        std::ofstream file(path);
+        if (!file.is_open()) return;
+        file << std::fixed << std::setprecision(6);
+        file << "SCENE_VERSION 1\n";
+        file << "DIRECTIONAL_YAW "        << directionalYaw         << "\n";
+        file << "DIRECTIONAL_PITCH "      << directionalPitch        << "\n";
+        file << "DIRECTIONAL_COLOR "      << directionalColor.x << " " << directionalColor.y << " " << directionalColor.z << "\n";
+        file << "DIRECTIONAL_INTENSITY " << directionalIntensity    << "\n";
+        file << "AMBIENT_TERM "           << runtimeAmbientTerm      << "\n";
+        file << "SHADOW_DARKNESS "        << runtimeShadowDarkness   << "\n";
+        file << "PCSS_ENABLED "           << (runtimePcssEnabled ? 1 : 0) << "\n";
+        file << "PCSS_SEARCH_RADIUS "     << runtimePcssSearchRadius << "\n";
+        file << "PCSS_MAX_FILTER_RADIUS " << runtimePcssMaxFilterRadius << "\n";
+        file << "POINT_LIGHT_COUNT "      << runtimePointLights.size() << "\n";
+        for (const auto& pl : runtimePointLights)
+        {
+            file << "POINT_LIGHT "
+                 << pl.position.x << " " << pl.position.y << " " << pl.position.z << " "
+                 << pl.color.x    << " " << pl.color.y    << " " << pl.color.z    << " "
+                 << pl.intensity  << " " << pl.range      << "\n";
+        }
+        const auto& allObjects = sceneGraph.GetObjects();
+        file << "OBJECT_COUNT " << allObjects.size() << "\n";
+        for (const auto& obj : allObjects)
+        {
+            GameObject* go = sceneGraph.GetById(obj.GetId());
+            if (!go) continue;
+            const TransformComponent& t = go->GetTransform();
+            const RendererComponent&  r = go->GetRenderer();
+            file << "OBJECT "
+                 << go->GetId()       << " "
+                 << go->GetParentId() << " "
+                 << static_cast<int>(go->GetMeshType()) << " "
+                 << go->GetModelId()  << " "
+                 << (r.useTexture   ? 1 : 0) << " "
+                 << (r.visible      ? 1 : 0) << " "
+                 << (r.castsShadow  ? 1 : 0) << "\n";
+            file << "OBJECT_NAME "     << go->GetName()    << "\n";
+            file << "OBJECT_POSITION " << t.position.x << " " << t.position.y << " " << t.position.z << "\n";
+            file << "OBJECT_ROTATION " << t.rotation.x << " " << t.rotation.y << " " << t.rotation.z << "\n";
+            file << "OBJECT_SCALE "    << t.scale.x    << " " << t.scale.y    << " " << t.scale.z    << "\n";
+            file << "OBJECT_COLOR "    << r.materialColor.x << " " << r.materialColor.y << " " << r.materialColor.z << " " << r.materialColor.w << "\n";
+            file << "OBJECT_ALBEDO "   << r.albedoIntensity << "\n";
+        }
+        currentScenePath = path;
+    };
+
+    auto loadScene = [&](const std::string& path)
+    {
+        std::ifstream file(path);
+        if (!file.is_open()) return;
+
+        struct SavedObj
+        {
+            std::uint32_t savedId = 0, savedParentId = 0;
+            MeshType meshType = MeshType::Cube;
+            std::uint32_t modelId = 0;
+            bool useTexture = false, visible = true, castsShadow = true;
+            std::string name;
+            XMFLOAT3 position{0.0f, 0.0f, 0.0f};
+            XMFLOAT3 rotation{0.0f, 0.0f, 0.0f};
+            XMFLOAT3 scale{1.0f, 1.0f, 1.0f};
+            XMFLOAT4 color{1.0f, 1.0f, 1.0f, 1.0f};
+            float albedoIntensity = 1.6f;
+        };
+
+        float newDirYaw          = directionalYaw;
+        float newDirPitch        = directionalPitch;
+        XMFLOAT3 newDirColor     = directionalColor;
+        float newDirIntensity    = directionalIntensity;
+        float newAmbientTerm     = runtimeAmbientTerm;
+        float newShadowDarkness  = runtimeShadowDarkness;
+        bool  newPcssEnabled     = runtimePcssEnabled;
+        float newPcssSearch      = runtimePcssSearchRadius;
+        float newPcssMaxFilter   = runtimePcssMaxFilterRadius;
+        std::vector<RuntimePointLight> newPointLights;
+        std::vector<SavedObj> savedObjects;
+        SavedObj* current = nullptr;
+
+        std::string line;
+        while (std::getline(file, line))
+        {
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream ss(line);
+            std::string kw;
+            ss >> kw;
+            if      (kw == "DIRECTIONAL_YAW")        { ss >> newDirYaw; }
+            else if (kw == "DIRECTIONAL_PITCH")       { ss >> newDirPitch; }
+            else if (kw == "DIRECTIONAL_COLOR")       { ss >> newDirColor.x >> newDirColor.y >> newDirColor.z; }
+            else if (kw == "DIRECTIONAL_INTENSITY")   { ss >> newDirIntensity; }
+            else if (kw == "AMBIENT_TERM")            { ss >> newAmbientTerm; }
+            else if (kw == "SHADOW_DARKNESS")         { ss >> newShadowDarkness; }
+            else if (kw == "PCSS_ENABLED")            { int v; ss >> v; newPcssEnabled = (v != 0); }
+            else if (kw == "PCSS_SEARCH_RADIUS")      { ss >> newPcssSearch; }
+            else if (kw == "PCSS_MAX_FILTER_RADIUS")  { ss >> newPcssMaxFilter; }
+            else if (kw == "POINT_LIGHT")
+            {
+                RuntimePointLight pl{};
+                ss >> pl.position.x >> pl.position.y >> pl.position.z
+                   >> pl.color.x    >> pl.color.y    >> pl.color.z
+                   >> pl.intensity  >> pl.range;
+                newPointLights.push_back(pl);
+            }
+            else if (kw == "OBJECT")
+            {
+                savedObjects.emplace_back();
+                current = &savedObjects.back();
+                int mt = 0, ut = 0, vi = 1, cs = 1;
+                ss >> current->savedId >> current->savedParentId >> mt >> current->modelId >> ut >> vi >> cs;
+                current->meshType   = static_cast<MeshType>(mt);
+                current->useTexture = (ut != 0);
+                current->visible    = (vi != 0);
+                current->castsShadow= (cs != 0);
+            }
+            else if (kw == "OBJECT_NAME" && current)
+            {
+                std::getline(ss, current->name);
+                if (!current->name.empty() && current->name.front() == ' ')
+                    current->name = current->name.substr(1);
+            }
+            else if (kw == "OBJECT_POSITION" && current) { ss >> current->position.x >> current->position.y >> current->position.z; }
+            else if (kw == "OBJECT_ROTATION" && current) { ss >> current->rotation.x >> current->rotation.y >> current->rotation.z; }
+            else if (kw == "OBJECT_SCALE"    && current) { ss >> current->scale.x    >> current->scale.y    >> current->scale.z; }
+            else if (kw == "OBJECT_COLOR"    && current) { ss >> current->color.x    >> current->color.y    >> current->color.z    >> current->color.w; }
+            else if (kw == "OBJECT_ALBEDO"   && current) { ss >> current->albedoIntensity; }
+        }
+
+        // Apply parsed values
+        directionalYaw             = newDirYaw;
+        directionalPitch           = newDirPitch;
+        directionalColor           = newDirColor;
+        directionalIntensity       = newDirIntensity;
+        runtimeAmbientTerm         = newAmbientTerm;
+        runtimeShadowDarkness      = newShadowDarkness;
+        runtimePcssEnabled         = newPcssEnabled;
+        runtimePcssSearchRadius    = newPcssSearch;
+        runtimePcssMaxFilterRadius = newPcssMaxFilter;
+        runtimePointLights         = std::move(newPointLights);
+
+        // Rebuild scene graph (BFS order so parents are always created before children)
+        sceneGraph.Clear();
+        selectedGameObjectId = 0;
+        currentScenePath = path;
+
+        std::unordered_map<std::uint32_t, std::uint32_t> idMap;
+        std::vector<SavedObj*> remaining;
+        for (auto& obj : savedObjects) remaining.push_back(&obj);
+
+        while (!remaining.empty())
+        {
+            bool progress = false;
+            std::vector<SavedObj*> nextRemaining;
+            for (SavedObj* obj : remaining)
+            {
+                if (obj->savedParentId == 0 || idMap.count(obj->savedParentId))
+                {
+                    const std::uint32_t newParentId = (obj->savedParentId == 0) ? 0 : idMap.at(obj->savedParentId);
+                    GameObject& created = sceneGraph.CreateGameObject(obj->name, obj->meshType, newParentId);
+                    idMap[obj->savedId] = created.GetId();
+                    TransformComponent& t = created.GetTransform();
+                    t.position = obj->position;
+                    t.rotation = obj->rotation;
+                    t.scale    = obj->scale;
+                    RendererComponent& r = created.GetRenderer();
+                    r.materialColor   = obj->color;
+                    r.albedoIntensity = obj->albedoIntensity;
+                    r.useTexture      = obj->useTexture;
+                    r.visible         = obj->visible;
+                    r.castsShadow     = obj->castsShadow;
+                    created.SetModelId(obj->modelId);
+                    progress = true;
+                }
+                else
+                {
+                    nextRemaining.push_back(obj);
+                }
+            }
+            remaining = nextRemaining;
+            if (!progress) break;
+        }
+
+        if (!sceneGraph.GetRootIds().empty())
+            selectedGameObjectId = sceneGraph.GetRootIds().front();
+    };
 
     auto updateWindowTitle = [window](
         int mode,
@@ -3206,8 +3451,43 @@ int Run(HINSTANCE instance, int showCommand)
         bool isGameViewAreaHovered = false;
         POINT mouseLookCenterClientCurrent = mouseCenterClient;
 
-        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(imguiIo.DisplaySize, ImGuiCond_Always);
+        const float menuBarHeight = ImGui::GetFrameHeight();
+        if (ImGui::BeginMainMenuBar())
+        {
+            if (ImGui::BeginMenu("File"))
+            {
+                if (ImGui::MenuItem("New Scene"))
+                {
+                    newScene();
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Save Scene..."))
+                {
+                    const std::string savePath = showSaveDialog();
+                    if (!savePath.empty())
+                        saveScene(savePath);
+                }
+                if (ImGui::MenuItem("Load Scene..."))
+                {
+                    const std::string loadPath = showOpenDialog();
+                    if (!loadPath.empty())
+                        loadScene(loadPath);
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Settings"))
+            {
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Help"))
+            {
+                ImGui::EndMenu();
+            }
+            ImGui::EndMainMenuBar();
+        }
+
+        ImGui::SetNextWindowPos(ImVec2(0.0f, menuBarHeight), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(imguiIo.DisplaySize.x, imguiIo.DisplaySize.y - menuBarHeight), ImGuiCond_Always);
         ImGuiWindowFlags editorWindowFlags =
             ImGuiWindowFlags_NoTitleBar |
             ImGuiWindowFlags_NoResize |
@@ -3453,7 +3733,14 @@ int Run(HINSTANCE instance, int showCommand)
             ImGui::SameLine(0.0f, 0.0f);
             ImGui::BeginChild("GameViewPanel", ImVec2(gamePanelWidth, 0.0f), true);
             isGameViewAreaHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
-            ImGui::Text("Game View");
+
+            {
+                const float fps = (deltaSeconds > 0.0f) ? (1.0f / deltaSeconds) : 0.0f;
+                smoothedFps = (smoothedFps == 0.0f) ? fps : (smoothedFps * 0.9f + fps * 0.1f);
+                const UINT renderW = sceneRenderWidth  * (runtimeAaMode == AntiAliasingMode::Ssaa ? kSsaaScale : 1);
+                const UINT renderH = sceneRenderHeight * (runtimeAaMode == AntiAliasingMode::Ssaa ? kSsaaScale : 1);
+                ImGui::Text("Game View  |  %.0f FPS  |  %ux%u", smoothedFps, renderW, renderH);
+            }
             ImGui::Separator();
 
             const ImVec2 avail = ImGui::GetContentRegionAvail();
