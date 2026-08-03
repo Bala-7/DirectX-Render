@@ -13,6 +13,8 @@ This folder contains implementation-focused documentation for render engine feat
 - [Spotlights](lights/spotlights.md)
 - [Spotlight Shadows](shadows/spotlight-shadows.md)
 - [MSAA Runtime Control](rendering/msaa.md)
+- [FXAA — Fast Approximate Anti-Aliasing](rendering/fxaa.md)
+- [SSAA — Super Sampling Anti-Aliasing (4x)](rendering/ssaa.md)
 - [PCSS Soft Shadows](shadows/pcss-soft-shadows.md)
 - [ImGui Debug Interface](editor/imgui-debug-interface.md)
 
@@ -25,7 +27,7 @@ This folder contains implementation-focused documentation for render engine feat
 - **Editor layout:** left debug/scene-graph panel + middle game-view panel + right Inspector panel
 - **Shadowing:** 3 shadow maps (`spotlight0`, `spotlight1`, `directional`)
 - **Background:** Cubemap skybox loaded from `Assets/Images/Skybox/Daylight`
-- **Anti-aliasing:** Runtime-switchable MSAA path (8x target sample count when supported)
+- **Anti-aliasing:** Runtime-switchable modes: **MSAA** (8x hardware, adapter-dependent), **FXAA** (screen-space post-process), **SSAA 4x** (render at 2× resolution + box-filter downsample)
 - **Soft shadows:** Toggleable PCSS branch in scene pixel shader
 - **Debug UI:** Dear ImGui (`imgui_impl_win32` + `imgui_impl_dx11`)
 

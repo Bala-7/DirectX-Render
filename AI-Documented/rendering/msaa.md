@@ -22,9 +22,10 @@ Adds multisample anti-aliasing (MSAA) to reduce edge aliasing in the rendered im
 - Sample quality for MSAA path uses `min(colorQuality, depthQuality) - 1`.
 
 ### Frame Render Flow
-- Active path is chosen every frame using `runtimeMsaaEnabled` and `msaaSupported`.
-- Scene and debug overlay render into active scene targets.
-- If MSAA is active, final composed image is resolved into swapchain backbuffer via `ResolveSubresource` before `Present`.
+- Active path is chosen every frame via `runtimeAaMode == AntiAliasingMode::Msaa` and `msaaSupported`.
+- Scene renders into `gameViewMsaaRenderTargetView` + `msaaDepthStencilView`.
+- If MSAA is active, `ResolveSubresource` resolves the MSAA colour buffer into `gameViewColorBuffer`.
+- ImGui preview reads `gameViewShaderResourceView` (same as no-AA path after resolve).
 
 ## Runtime Controls
 - MSAA can be toggled through the ImGui debug interface.

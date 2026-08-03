@@ -38,15 +38,16 @@ constexpr UINT kWindowWidth = 1280;
 constexpr UINT kWindowHeight = 720;
 constexpr UINT kShadowMapSize = 1024;
 constexpr UINT kMsaaSampleCount = 8;
+constexpr UINT kSsaaScale = 2;
 constexpr float kMoveSpeed = 3.0f;
 constexpr float kLookSensitivity = 0.0025f;
 constexpr float kMaxPitch = 1.4f;
 constexpr wchar_t kSkyboxDirectory0[] = L"Assets/Images/Skybox/Daylight";
 constexpr wchar_t kSkyboxDirectory1[] = L"../Assets/Images/Skybox/Daylight";
 constexpr wchar_t kSkyboxDirectory2[] = L"../../Assets/Images/Skybox/Daylight";
-constexpr char kSponzaModelPath0[] = "Assets/Models/Sponza/sponza.obj";
-constexpr char kSponzaModelPath1[] = "../Assets/Models/Sponza/sponza.obj";
-constexpr char kSponzaModelPath2[] = "../../Assets/Models/Sponza/sponza.obj";
+constexpr char kSponzaModelPath0[] = "Assets/Models/Sponza/glTF/Sponza.gltf";
+constexpr char kSponzaModelPath1[] = "../Assets/Models/Sponza/glTF/Sponza.gltf";
+constexpr char kSponzaModelPath2[] = "../../Assets/Models/Sponza/glTF/Sponza.gltf";
 
 struct Vertex
 {
@@ -95,9 +96,36 @@ struct DebugBufferData
     XMFLOAT4 params;
 };
 
+struct FxaaBufferData
+{
+    XMFLOAT4 params;
+};
+
 struct SkyboxFrameBufferData
 {
     XMFLOAT4X4 viewProjection;
+};
+
+static constexpr int kMaxPointLights = 8;
+
+struct PointLightBufferEntry
+{
+    XMFLOAT4 position; // xyz = world position, w = range
+    XMFLOAT4 color;    // rgb = color, a = intensity
+};
+
+struct PointLightBufferData
+{
+    PointLightBufferEntry lights[kMaxPointLights];
+    XMFLOAT4 params; // x = active light count
+};
+
+struct RuntimePointLight
+{
+    XMFLOAT3 position;
+    XMFLOAT3 color;
+    float intensity;
+    float range;
 };
 
 enum class MeshType
@@ -105,6 +133,14 @@ enum class MeshType
     Cube,
     Plane,
     Model,
+};
+
+enum class AntiAliasingMode
+{
+    None = 0,
+    Msaa = 1,
+    Fsaa = 2,
+    Ssaa = 3,
 };
 
 const char* MeshTypeToString(MeshType meshType)
@@ -120,6 +156,23 @@ const char* MeshTypeToString(MeshType meshType)
     return "Plane";
 }
 
+const char* AntiAliasingModeToString(AntiAliasingMode mode, bool msaaSupported)
+{
+    if (mode == AntiAliasingMode::Msaa)
+    {
+        return msaaSupported ? "MSAA" : "MSAA UNSUPPORTED";
+    }
+    if (mode == AntiAliasingMode::Fsaa)
+    {
+        return "FSAA";
+    }
+    if (mode == AntiAliasingMode::Ssaa)
+    {
+        return "SSAA 4x";
+    }
+    return "NO AA";
+}
+
 struct TransformComponent
 {
     XMFLOAT3 position = {0.0f, 0.0f, 0.0f};
@@ -130,6 +183,7 @@ struct TransformComponent
 struct RendererComponent
 {
     XMFLOAT4 materialColor = {1.0f, 1.0f, 1.0f, 1.0f};
+    float albedoIntensity = 1.6f;
     bool useTexture = false;
     bool visible = true;
     bool castsShadow = true;
@@ -1078,6 +1132,14 @@ int Run(HINSTANCE instance, int showCommand)
     ComPtr<ID3D11Texture2D> gameViewColorBuffer;
     ComPtr<ID3D11RenderTargetView> gameViewRenderTargetView;
     ComPtr<ID3D11ShaderResourceView> gameViewShaderResourceView;
+    ComPtr<ID3D11Texture2D> fsaaColorBuffer;
+    ComPtr<ID3D11RenderTargetView> fsaaRenderTargetView;
+    ComPtr<ID3D11ShaderResourceView> fsaaShaderResourceView;
+    ComPtr<ID3D11Texture2D> ssaaColorBuffer;
+    ComPtr<ID3D11RenderTargetView> ssaaRenderTargetView;
+    ComPtr<ID3D11ShaderResourceView> ssaaShaderResourceView;
+    ComPtr<ID3D11Texture2D> ssaaDepthBuffer;
+    ComPtr<ID3D11DepthStencilView> ssaaDepthStencilView;
     ComPtr<ID3D11Texture2D> gameViewMsaaColorBuffer;
     ComPtr<ID3D11RenderTargetView> gameViewMsaaRenderTargetView;
     ComPtr<ID3D11Texture2D> depthBuffer;
@@ -1123,6 +1185,70 @@ int Run(HINSTANCE instance, int showCommand)
         }
 
         createResult = device->CreateShaderResourceView(gameViewColorBuffer.Get(), nullptr, &gameViewShaderResourceView);
+        if (FAILED(createResult))
+        {
+            return false;
+        }
+
+        createResult = device->CreateTexture2D(&gameViewDesc, nullptr, &fsaaColorBuffer);
+        if (FAILED(createResult))
+        {
+            return false;
+        }
+
+        createResult = device->CreateRenderTargetView(fsaaColorBuffer.Get(), nullptr, &fsaaRenderTargetView);
+        if (FAILED(createResult))
+        {
+            return false;
+        }
+
+        createResult = device->CreateShaderResourceView(fsaaColorBuffer.Get(), nullptr, &fsaaShaderResourceView);
+        if (FAILED(createResult))
+        {
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC ssaaColorDesc = gameViewDesc;
+        ssaaColorDesc.Width = width * kSsaaScale;
+        ssaaColorDesc.Height = height * kSsaaScale;
+        ssaaColorDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+        createResult = device->CreateTexture2D(&ssaaColorDesc, nullptr, &ssaaColorBuffer);
+        if (FAILED(createResult))
+        {
+            return false;
+        }
+
+        createResult = device->CreateRenderTargetView(ssaaColorBuffer.Get(), nullptr, &ssaaRenderTargetView);
+        if (FAILED(createResult))
+        {
+            return false;
+        }
+
+        createResult = device->CreateShaderResourceView(ssaaColorBuffer.Get(), nullptr, &ssaaShaderResourceView);
+        if (FAILED(createResult))
+        {
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC ssaaDepthDesc{};
+        ssaaDepthDesc.Width = width * kSsaaScale;
+        ssaaDepthDesc.Height = height * kSsaaScale;
+        ssaaDepthDesc.MipLevels = 1;
+        ssaaDepthDesc.ArraySize = 1;
+        ssaaDepthDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        ssaaDepthDesc.SampleDesc.Count = 1;
+        ssaaDepthDesc.SampleDesc.Quality = 0;
+        ssaaDepthDesc.Usage = D3D11_USAGE_DEFAULT;
+        ssaaDepthDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+
+        createResult = device->CreateTexture2D(&ssaaDepthDesc, nullptr, &ssaaDepthBuffer);
+        if (FAILED(createResult))
+        {
+            return false;
+        }
+
+        createResult = device->CreateDepthStencilView(ssaaDepthBuffer.Get(), nullptr, &ssaaDepthStencilView);
         if (FAILED(createResult))
         {
             return false;
@@ -1357,6 +1483,18 @@ int Run(HINSTANCE instance, int showCommand)
             float4 materialParams;
         };
 
+        struct PointLightEntry
+        {
+            float4 position; // xyz = world position, w = range
+            float4 color;    // rgb = color, a = intensity
+        };
+
+        cbuffer PointLightBuffer : register(b2)
+        {
+            PointLightEntry pointLights[8];
+            float4 pointLightParams; // x = active light count
+        };
+
         struct PSInput
         {
             float4 position : SV_POSITION;
@@ -1454,16 +1592,21 @@ int Run(HINSTANCE instance, int showCommand)
             float3 viewDirection = normalize(cameraPosition.xyz - input.worldPosition);
 
             float useTexture = materialParams.x;
+            float albedoIntensity = materialParams.y;
             float3 sampledAlbedo = baseTexture.Sample(textureSampler, input.uv).rgb;
-            float3 albedo = lerp(materialColor.rgb, sampledAlbedo, useTexture);
+            float3 albedo = lerp(materialColor.rgb, sampledAlbedo, useTexture) * albedoIntensity;
 
             float specularPower = lightingParams.x;
             float shadowBias = lightingParams.y;
             float pcssEnabled = shadowParams.z;
+            float shadowDarkness = saturate(lightingParams.w);
 
             float shadow0 = (pcssEnabled > 0.5f) ? ComputeShadowPCSS(shadowMap0, input.shadowPosition0, shadowBias) : ComputeShadow(shadowMap0, input.shadowPosition0, shadowBias);
             float shadow1 = (pcssEnabled > 0.5f) ? ComputeShadowPCSS(shadowMap1, input.shadowPosition1, shadowBias) : ComputeShadow(shadowMap1, input.shadowPosition1, shadowBias);
             float shadow2 = (pcssEnabled > 0.5f) ? ComputeShadowPCSS(shadowMap2, input.shadowPosition2, shadowBias) : ComputeShadow(shadowMap2, input.shadowPosition2, shadowBias);
+            shadow0 = lerp(1.0f, shadow0, shadowDarkness);
+            shadow1 = lerp(1.0f, shadow1, shadowDarkness);
+            shadow2 = lerp(1.0f, shadow2, shadowDarkness);
 
             float3 totalLight = ambientColor.rgb * ambientColor.a;
 
@@ -1494,6 +1637,20 @@ int Run(HINSTANCE instance, int showCommand)
             float3 reflectionDirectional = reflect(-directionalToLight, normal);
             float specularDirectional = pow(max(dot(viewDirection, reflectionDirectional), 0.0f), specularPower);
             totalLight += ((diffuseDirectional * albedo) + specularDirectional.xxx) * directionalLightColor.rgb * directionalLightColor.a * shadow2;
+
+            int numPointLights = (int)pointLightParams.x;
+            for (int i = 0; i < numPointLights; ++i)
+            {
+                float3 toPointLight = pointLights[i].position.xyz - input.worldPosition;
+                float distPL = length(toPointLight);
+                float3 plDir = toPointLight / max(distPL, 0.0001f);
+                float attenuationPL = 1.0f / (1.0f + 0.25f * distPL + 0.08f * distPL * distPL);
+                float rangeFadePL = saturate(1.0f - (distPL / max(pointLights[i].position.w, 0.0001f)));
+                float diffusePL = max(dot(normal, plDir), 0.0f);
+                float3 reflectionPL = reflect(-plDir, normal);
+                float specularPL = pow(max(dot(viewDirection, reflectionPL), 0.0f), specularPower);
+                totalLight += ((diffusePL * albedo) + specularPL.xxx) * pointLights[i].color.rgb * pointLights[i].color.a * attenuationPL * rangeFadePL * rangeFadePL;
+            }
 
             return float4(saturate(totalLight), 1.0f);
         }
@@ -1597,6 +1754,105 @@ int Run(HINSTANCE instance, int showCommand)
         }
     )";
 
+    const char fxaaVertexShaderSource[] = R"(
+        struct VSOutput
+        {
+            float4 position : SV_POSITION;
+            float2 uv : TEXCOORD0;
+        };
+
+        VSOutput main(uint vertexId : SV_VertexID)
+        {
+            VSOutput output;
+
+            float2 positions[4] = {
+                float2(-1.0f, 1.0f),
+                float2(1.0f, 1.0f),
+                float2(-1.0f, -1.0f),
+                float2(1.0f, -1.0f)};
+
+            float2 uvs[4] = {
+                float2(0.0f, 0.0f),
+                float2(1.0f, 0.0f),
+                float2(0.0f, 1.0f),
+                float2(1.0f, 1.0f)};
+
+            output.position = float4(positions[vertexId], 0.0f, 1.0f);
+            output.uv = uvs[vertexId];
+            return output;
+        }
+    )";
+
+    const char fxaaPixelShaderSource[] = R"(
+        Texture2D sceneTexture : register(t0);
+        SamplerState sceneSampler : register(s0);
+
+        cbuffer FxaaBuffer : register(b0)
+        {
+            float4 params;
+        };
+
+        struct PSInput
+        {
+            float4 position : SV_POSITION;
+            float2 uv : TEXCOORD0;
+        };
+
+        float Luma(float3 rgb)
+        {
+            return dot(rgb, float3(0.299f, 0.587f, 0.114f));
+        }
+
+        float4 main(PSInput input) : SV_TARGET
+        {
+            float2 texelSize = params.xy;
+            float edgeThreshold = params.z;
+
+            float3 rgbM = sceneTexture.Sample(sceneSampler, input.uv).rgb;
+            float3 rgbNW = sceneTexture.Sample(sceneSampler, input.uv + float2(-texelSize.x, -texelSize.y)).rgb;
+            float3 rgbNE = sceneTexture.Sample(sceneSampler, input.uv + float2(texelSize.x, -texelSize.y)).rgb;
+            float3 rgbSW = sceneTexture.Sample(sceneSampler, input.uv + float2(-texelSize.x, texelSize.y)).rgb;
+            float3 rgbSE = sceneTexture.Sample(sceneSampler, input.uv + float2(texelSize.x, texelSize.y)).rgb;
+
+            float lumaM = Luma(rgbM);
+            float lumaNW = Luma(rgbNW);
+            float lumaNE = Luma(rgbNE);
+            float lumaSW = Luma(rgbSW);
+            float lumaSE = Luma(rgbSE);
+
+            float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+            float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+            float lumaRange = lumaMax - lumaMin;
+            if (lumaRange < edgeThreshold)
+            {
+                return float4(rgbM, 1.0f);
+            }
+
+            float2 dir;
+            dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
+            dir.y = (lumaNW + lumaSW) - (lumaNE + lumaSE);
+
+            const float reduceMul = 1.0f / 8.0f;
+            const float reduceMin = 1.0f / 128.0f;
+            float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25f * reduceMul), reduceMin);
+            float inverseDirAdjustment = 1.0f / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+            dir = clamp(dir * inverseDirAdjustment, float2(-8.0f, -8.0f), float2(8.0f, 8.0f));
+            dir *= texelSize;
+
+            float3 rgbA = 0.5f * (
+                sceneTexture.Sample(sceneSampler, input.uv + dir * (1.0f / 3.0f - 0.5f)).rgb +
+                sceneTexture.Sample(sceneSampler, input.uv + dir * (2.0f / 3.0f - 0.5f)).rgb);
+
+            float3 rgbB = rgbA * 0.5f + 0.25f * (
+                sceneTexture.Sample(sceneSampler, input.uv + dir * -0.5f).rgb +
+                sceneTexture.Sample(sceneSampler, input.uv + dir * 0.5f).rgb);
+
+            float lumaB = Luma(rgbB);
+            float3 finalColor = (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
+            return float4(finalColor, 1.0f);
+        }
+    )";
+
     const char skyboxVertexShaderSource[] = R"(
         cbuffer SkyboxFrameBuffer : register(b0)
         {
@@ -1641,6 +1897,32 @@ int Run(HINSTANCE instance, int showCommand)
         }
     )";
 
+    const char ssaaDownsamplePixelShaderSource[] = R"(
+        Texture2D ssaaTexture : register(t0);
+        SamplerState ssaaSampler : register(s0);
+
+        cbuffer SsaaBuffer : register(b0)
+        {
+            float4 params; // xy = SSAA texel size (1/ssaaWidth, 1/ssaaHeight)
+        };
+
+        struct PSInput
+        {
+            float4 position : SV_POSITION;
+            float2 uv : TEXCOORD0;
+        };
+
+        float4 main(PSInput input) : SV_TARGET
+        {
+            float2 halfTexel = params.xy * 0.5f;
+            float3 c0 = ssaaTexture.Sample(ssaaSampler, input.uv + float2(-halfTexel.x, -halfTexel.y)).rgb;
+            float3 c1 = ssaaTexture.Sample(ssaaSampler, input.uv + float2( halfTexel.x, -halfTexel.y)).rgb;
+            float3 c2 = ssaaTexture.Sample(ssaaSampler, input.uv + float2(-halfTexel.x,  halfTexel.y)).rgb;
+            float3 c3 = ssaaTexture.Sample(ssaaSampler, input.uv + float2( halfTexel.x,  halfTexel.y)).rgb;
+            return float4((c0 + c1 + c2 + c3) * 0.25f, 1.0f);
+        }
+    )";
+
     UINT shaderCompileFlags = D3DCOMPILE_ENABLE_STRICTNESS;
 #if defined(_DEBUG)
     shaderCompileFlags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
@@ -1651,6 +1933,9 @@ int Run(HINSTANCE instance, int showCommand)
     ComPtr<ID3DBlob> shadowVertexShaderBytecode;
     ComPtr<ID3DBlob> debugVertexShaderBytecode;
     ComPtr<ID3DBlob> debugPixelShaderBytecode;
+    ComPtr<ID3DBlob> fxaaVertexShaderBytecode;
+    ComPtr<ID3DBlob> fxaaPixelShaderBytecode;
+    ComPtr<ID3DBlob> ssaaPixelShaderBytecode;
     ComPtr<ID3DBlob> skyboxVertexShaderBytecode;
     ComPtr<ID3DBlob> skyboxPixelShaderBytecode;
     ComPtr<ID3DBlob> errorBlob;
@@ -1802,6 +2087,69 @@ int Run(HINSTANCE instance, int showCommand)
         return -1;
     }
 
+    result = D3DCompile(
+        fxaaVertexShaderSource,
+        sizeof(fxaaVertexShaderSource) - 1,
+        nullptr,
+        nullptr,
+        nullptr,
+        "main",
+        "vs_5_0",
+        shaderCompileFlags,
+        0,
+        &fxaaVertexShaderBytecode,
+        &errorBlob);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    result = D3DCompile(
+        fxaaPixelShaderSource,
+        sizeof(fxaaPixelShaderSource) - 1,
+        nullptr,
+        nullptr,
+        nullptr,
+        "main",
+        "ps_5_0",
+        shaderCompileFlags,
+        0,
+        &fxaaPixelShaderBytecode,
+        &errorBlob);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    result = D3DCompile(
+        ssaaDownsamplePixelShaderSource,
+        sizeof(ssaaDownsamplePixelShaderSource) - 1,
+        nullptr,
+        nullptr,
+        nullptr,
+        "main",
+        "ps_5_0",
+        shaderCompileFlags,
+        0,
+        &ssaaPixelShaderBytecode,
+        &errorBlob);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
     ComPtr<ID3D11VertexShader> sceneVertexShader;
     result = device->CreateVertexShader(
         sceneVertexShaderBytecode->GetBufferPointer(),
@@ -1868,6 +2216,51 @@ int Run(HINSTANCE instance, int showCommand)
         debugPixelShaderBytecode->GetBufferSize(),
         nullptr,
         &debugPixelShader);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    ComPtr<ID3D11VertexShader> fxaaVertexShader;
+    result = device->CreateVertexShader(
+        fxaaVertexShaderBytecode->GetBufferPointer(),
+        fxaaVertexShaderBytecode->GetBufferSize(),
+        nullptr,
+        &fxaaVertexShader);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    ComPtr<ID3D11PixelShader> fxaaPixelShader;
+    result = device->CreatePixelShader(
+        fxaaPixelShaderBytecode->GetBufferPointer(),
+        fxaaPixelShaderBytecode->GetBufferSize(),
+        nullptr,
+        &fxaaPixelShader);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    ComPtr<ID3D11PixelShader> ssaaPixelShader;
+    result = device->CreatePixelShader(
+        ssaaPixelShaderBytecode->GetBufferPointer(),
+        ssaaPixelShaderBytecode->GetBufferSize(),
+        nullptr,
+        &ssaaPixelShader);
     if (FAILED(result))
     {
         if (shouldUninitializeCom)
@@ -2155,6 +2548,7 @@ int Run(HINSTANCE instance, int showCommand)
     groundPlane.SetMaterialColor(XMFLOAT4(0.58f, 0.58f, 0.62f, 1.0f));
     groundPlane.SetUsesTexture(false);
     groundPlane.SetCastsShadow(false);
+    groundPlane.SetVisible(false);
 
     std::vector<ModelResource> loadedModels;
     auto getModelById = [&](std::uint32_t modelId) -> const ModelResource*
@@ -2249,6 +2643,38 @@ int Run(HINSTANCE instance, int showCommand)
         return -1;
     }
 
+    D3D11_BUFFER_DESC fxaaBufferDesc{};
+    fxaaBufferDesc.ByteWidth = sizeof(FxaaBufferData);
+    fxaaBufferDesc.Usage = D3D11_USAGE_DEFAULT;
+    fxaaBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+
+    ComPtr<ID3D11Buffer> fxaaBuffer;
+    result = device->CreateBuffer(&fxaaBufferDesc, nullptr, &fxaaBuffer);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    D3D11_BUFFER_DESC ssaaBufferDesc{};
+    ssaaBufferDesc.ByteWidth = sizeof(FxaaBufferData);
+    ssaaBufferDesc.Usage = D3D11_USAGE_DEFAULT;
+    ssaaBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+
+    ComPtr<ID3D11Buffer> ssaaBuffer;
+    result = device->CreateBuffer(&ssaaBufferDesc, nullptr, &ssaaBuffer);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
     D3D11_BUFFER_DESC skyboxFrameBufferDesc{};
     skyboxFrameBufferDesc.ByteWidth = sizeof(SkyboxFrameBufferData);
     skyboxFrameBufferDesc.Usage = D3D11_USAGE_DEFAULT;
@@ -2256,6 +2682,22 @@ int Run(HINSTANCE instance, int showCommand)
 
     ComPtr<ID3D11Buffer> skyboxFrameBuffer;
     result = device->CreateBuffer(&skyboxFrameBufferDesc, nullptr, &skyboxFrameBuffer);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    D3D11_BUFFER_DESC pointLightBufferDesc{};
+    pointLightBufferDesc.ByteWidth = sizeof(PointLightBufferData);
+    pointLightBufferDesc.Usage = D3D11_USAGE_DEFAULT;
+    pointLightBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+
+    ComPtr<ID3D11Buffer> pointLightBuffer;
+    result = device->CreateBuffer(&pointLightBufferDesc, nullptr, &pointLightBuffer);
     if (FAILED(result))
     {
         if (shouldUninitializeCom)
@@ -2298,6 +2740,38 @@ int Run(HINSTANCE instance, int showCommand)
 
     ComPtr<ID3D11SamplerState> textureSampler;
     result = device->CreateSamplerState(&textureSamplerDesc, &textureSampler);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    D3D11_SAMPLER_DESC fsaaSamplerDesc{};
+    fsaaSamplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    fsaaSamplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    fsaaSamplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    fsaaSamplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    fsaaSamplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    fsaaSamplerDesc.MinLOD = 0.0f;
+    fsaaSamplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+
+    ComPtr<ID3D11SamplerState> fsaaSampler;
+    result = device->CreateSamplerState(&fsaaSamplerDesc, &fsaaSampler);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    // SSAA uses the same linear clamp sampler as FSAA for the downsample pass
+    ComPtr<ID3D11SamplerState> ssaaSampler;
+    result = device->CreateSamplerState(&fsaaSamplerDesc, &ssaaSampler);
     if (FAILED(result))
     {
         if (shouldUninitializeCom)
@@ -2471,9 +2945,9 @@ int Run(HINSTANCE instance, int showCommand)
     debugViewport.MinDepth = 0.0f;
     debugViewport.MaxDepth = 1.0f;
 
-    XMFLOAT3 cameraPosition = {0.0f, 1.2f, -3.0f};
-    float cameraYaw = 0.0f;
-    float cameraPitch = 0.0f;
+    XMFLOAT3 cameraPosition = {8.5, 4.5f, 0.0f};
+    float cameraYaw = -1.5f;
+    float cameraPitch = -0.3f;
 
     const XMVECTOR lightPosition0 = XMVectorSet(-2.0f, 2.5f, 0.0f, 1.0f);
     const XMVECTOR lightPosition1 = XMVectorSet(2.0f, 2.5f, 0.0f, 1.0f);
@@ -2494,21 +2968,25 @@ int Run(HINSTANCE instance, int showCommand)
     int shadowDebugMode = 0;
     bool debugToggleWasDown = false;
     bool wasCapturingMouseLook = false;
-    bool runtimeMsaaEnabled = msaaSupported;
+    AntiAliasingMode runtimeAaMode = msaaSupported ? AntiAliasingMode::Msaa : AntiAliasingMode::None;
     bool runtimePcssEnabled = true;
-    float runtimePcssSearchRadius = 0.01f;
+    float runtimePcssSearchRadius = 0.0016f;
     float runtimePcssMaxFilterRadius = 0.05f;
-    float directionalYaw = XMConvertToRadians(-90.0f);
-    float directionalPitch = XMConvertToRadians(-35.0f);
+    float runtimeShadowDarkness = 0.5f;
+    float runtimeAmbientTerm = 1.0f;
+    float runtimeFsaaEdgeThreshold = 0.0833f;
+    float directionalYaw = XMConvertToRadians(-74.0f);
+    float directionalPitch = XMConvertToRadians(-53.0f);
     XMFLOAT3 directionalColor = {1.0f, 1.0f, 1.0f};
-    float directionalIntensity = 0.55f;
+    float directionalIntensity = 0.90f;
     float editorLeftPanelRatio = 0.34f;
+    std::vector<RuntimePointLight> runtimePointLights;
     float editorInspectorPanelRatio = 0.24f;
     std::uint32_t selectedGameObjectId = groundPlane.GetId();
 
     auto updateWindowTitle = [window](
         int mode,
-        bool msaaActive,
+        AntiAliasingMode aaMode,
         bool hasMsaaSupport,
         bool pcssActive,
         float pcssSearchRadius,
@@ -2528,16 +3006,16 @@ int Run(HINSTANCE instance, int showCommand)
             modeLabel = "M: Shadow Map 2 (Directional)";
         }
 
-        const char* msaaLabel = hasMsaaSupport ? (msaaActive ? "ON" : "OFF") : "UNSUPPORTED";
+        const char* aaLabel = AntiAliasingModeToString(aaMode, hasMsaaSupport);
         const char* pcssLabel = pcssActive ? "ON" : "OFF";
 
         char titleBuffer[320]{};
         std::snprintf(
             titleBuffer,
             sizeof(titleBuffer),
-            "DirectX 11 Spotlights + Shadows [%-12s] [MSAA %s] [PCSS %s] [Search %.3f] [Soft %.3f]",
+            "DirectX 11 Spotlights + Shadows [%-12s] [AA %s] [PCSS %s] [Search %.3f] [Soft %.3f]",
             modeLabel,
-            msaaLabel,
+            aaLabel,
             pcssLabel,
             pcssSearchRadius,
             pcssMaxFilterRadius);
@@ -2546,7 +3024,7 @@ int Run(HINSTANCE instance, int showCommand)
 
     updateWindowTitle(
         shadowDebugMode,
-        runtimeMsaaEnabled,
+        runtimeAaMode,
         msaaSupported,
         runtimePcssEnabled,
         runtimePcssSearchRadius,
@@ -2611,6 +3089,14 @@ int Run(HINSTANCE instance, int showCommand)
             gameViewColorBuffer.Reset();
             gameViewRenderTargetView.Reset();
             gameViewShaderResourceView.Reset();
+            fsaaColorBuffer.Reset();
+            fsaaRenderTargetView.Reset();
+            fsaaShaderResourceView.Reset();
+            ssaaColorBuffer.Reset();
+            ssaaRenderTargetView.Reset();
+            ssaaShaderResourceView.Reset();
+            ssaaDepthBuffer.Reset();
+            ssaaDepthStencilView.Reset();
             gameViewMsaaColorBuffer.Reset();
             gameViewMsaaRenderTargetView.Reset();
             depthBuffer.Reset();
@@ -2707,7 +3193,7 @@ int Run(HINSTANCE instance, int showCommand)
             shadowDebugMode = (shadowDebugMode + 1) % 4;
             updateWindowTitle(
                 shadowDebugMode,
-                runtimeMsaaEnabled,
+                runtimeAaMode,
                 msaaSupported,
                 runtimePcssEnabled,
                 runtimePcssSearchRadius,
@@ -2763,18 +3249,41 @@ int Run(HINSTANCE instance, int showCommand)
             ImGui::Text("Hold Right Mouse Button in Game View for camera look");
             ImGui::Separator();
 
-            if (msaaSupported)
+            const char* aaModeLabels[] = {"No AA", "MSAA", "FSAA", "SSAA (4x)"};
+            int uiAaMode = static_cast<int>(runtimeAaMode);
+            if (!msaaSupported && uiAaMode == static_cast<int>(AntiAliasingMode::Msaa))
             {
-                bool uiMsaa = runtimeMsaaEnabled;
-                if (ImGui::Checkbox("MSAA", &uiMsaa))
+                uiAaMode = static_cast<int>(AntiAliasingMode::None);
+                runtimeAaMode = AntiAliasingMode::None;
+                uiChanged = true;
+            }
+            if (ImGui::Combo("Anti-Aliasing", &uiAaMode, aaModeLabels, IM_ARRAYSIZE(aaModeLabels)))
+            {
+                if (uiAaMode == static_cast<int>(AntiAliasingMode::Msaa) && !msaaSupported)
                 {
-                    runtimeMsaaEnabled = uiMsaa;
+                    runtimeAaMode = AntiAliasingMode::None;
+                }
+                else
+                {
+                    runtimeAaMode = static_cast<AntiAliasingMode>(uiAaMode);
+                }
+                uiChanged = true;
+            }
+            if (!msaaSupported)
+            {
+                ImGui::Text("MSAA is unavailable on this adapter.");
+            }
+
+            if (runtimeAaMode == AntiAliasingMode::Fsaa)
+            {
+                ImGui::Indent(14.0f);
+                float uiFsaaEdgeThreshold = runtimeFsaaEdgeThreshold;
+                if (ImGui::SliderFloat("FSAA Edge Threshold", &uiFsaaEdgeThreshold, 0.0312f, 0.2500f, "%.4f"))
+                {
+                    runtimeFsaaEdgeThreshold = uiFsaaEdgeThreshold;
                     uiChanged = true;
                 }
-            }
-            else
-            {
-                ImGui::Text("MSAA: unsupported on this adapter");
+                ImGui::Unindent(14.0f);
             }
 
             bool uiPcss = runtimePcssEnabled;
@@ -2784,32 +3293,98 @@ int Run(HINSTANCE instance, int showCommand)
                 uiChanged = true;
             }
 
-            float uiSearchRadius = runtimePcssSearchRadius;
-            if (ImGui::SliderFloat("PCSS Search Radius", &uiSearchRadius, 1.0f / static_cast<float>(kShadowMapSize), 0.05f, "%.4f"))
+            if (runtimePcssEnabled)
             {
-                runtimePcssSearchRadius = uiSearchRadius;
-                uiChanged = true;
+                ImGui::Indent(14.0f);
+                float uiSearchRadius = runtimePcssSearchRadius;
+                if (ImGui::SliderFloat("PCSS Search Radius", &uiSearchRadius, 1.0f / static_cast<float>(kShadowMapSize), 0.05f, "%.4f"))
+                {
+                    runtimePcssSearchRadius = uiSearchRadius;
+                    uiChanged = true;
+                }
+
+                float uiSoftRadius = runtimePcssMaxFilterRadius;
+                if (ImGui::SliderFloat("PCSS Soft Radius", &uiSoftRadius, runtimePcssSearchRadius, 0.20f, "%.4f"))
+                {
+                    runtimePcssMaxFilterRadius = uiSoftRadius;
+                    uiChanged = true;
+                }
+                ImGui::Unindent(14.0f);
             }
 
-            float uiSoftRadius = runtimePcssMaxFilterRadius;
-            if (ImGui::SliderFloat("PCSS Soft Radius", &uiSoftRadius, runtimePcssSearchRadius, 0.20f, "%.4f"))
+            if (ImGui::CollapsingHeader("Lighting", ImGuiTreeNodeFlags_DefaultOpen))
             {
-                runtimePcssMaxFilterRadius = uiSoftRadius;
-                uiChanged = true;
+                float uiShadowDarkness = runtimeShadowDarkness;
+                if (ImGui::SliderFloat("Shadow Darkness", &uiShadowDarkness, 0.0f, 1.0f, "%.2f"))
+                {
+                    runtimeShadowDarkness = uiShadowDarkness;
+                    uiChanged = true;
+                }
+
+                float uiAmbientTerm = runtimeAmbientTerm;
+                if (ImGui::SliderFloat("Ambient Term", &uiAmbientTerm, 0.0f, 3.0f, "%.2f"))
+                {
+                    runtimeAmbientTerm = uiAmbientTerm;
+                    uiChanged = true;
+                }
+
+                if (ImGui::SliderAngle("Directional Yaw", &directionalYaw, -180.0f, 180.0f))
+                {
+                    uiChanged = true;
+                }
+
+                if (ImGui::SliderAngle("Directional Pitch", &directionalPitch, -80.0f, 80.0f))
+                {
+                    uiChanged = true;
+                }
+
+                ImGui::SliderFloat("Directional Intensity", &directionalIntensity, 0.0f, 2.0f, "%.2f");
+                ImGui::SliderFloat3("Directional Color", &directionalColor.x, 0.0f, 2.0f, "%.2f");
+
+                ImGui::Separator();
+                ImGui::Text("Point Lights (%zu / %d)", runtimePointLights.size(), kMaxPointLights);
+                if (static_cast<int>(runtimePointLights.size()) < kMaxPointLights)
+                {
+                    if (ImGui::Button("Add Point Light"))
+                    {
+                        RuntimePointLight newLight{};
+                        newLight.position = cameraPosition;
+                        newLight.color = {1.0f, 1.0f, 1.0f};
+                        newLight.intensity = 1.5f;
+                        newLight.range = 6.0f;
+                        runtimePointLights.push_back(newLight);
+                    }
+                }
+                else
+                {
+                    ImGui::TextDisabled("Max point lights reached");
+                }
+
+                for (int i = 0; i < static_cast<int>(runtimePointLights.size()); ++i)
+                {
+                    ImGui::PushID(i);
+                    char header[32]{};
+                    std::snprintf(header, sizeof(header), "Point Light %d", i);
+                    if (ImGui::TreeNodeEx(header, ImGuiTreeNodeFlags_DefaultOpen))
+                    {
+                        ImGui::DragFloat3("Position", &runtimePointLights[i].position.x, 0.05f);
+                        ImGui::ColorEdit3("Color", &runtimePointLights[i].color.x);
+                        ImGui::DragFloat("Intensity", &runtimePointLights[i].intensity, 0.05f, 0.0f, 10.0f, "%.2f");
+                        ImGui::DragFloat("Range", &runtimePointLights[i].range, 0.1f, 0.1f, 50.0f, "%.1f");
+                        if (ImGui::Button("Remove"))
+                        {
+                            runtimePointLights.erase(runtimePointLights.begin() + i);
+                            ImGui::TreePop();
+                            ImGui::PopID();
+                            --i;
+                            continue;
+                        }
+                        ImGui::TreePop();
+                    }
+                    ImGui::PopID();
+                }
             }
 
-            if (ImGui::SliderAngle("Directional Yaw", &directionalYaw, -180.0f, 180.0f))
-            {
-                uiChanged = true;
-            }
-
-            if (ImGui::SliderAngle("Directional Pitch", &directionalPitch, -80.0f, 80.0f))
-            {
-                uiChanged = true;
-            }
-
-            ImGui::SliderFloat("Directional Intensity", &directionalIntensity, 0.0f, 2.0f, "%.2f");
-            ImGui::SliderFloat3("Directional Color", &directionalColor.x, 0.0f, 2.0f, "%.2f");
             ImGui::Text("Shadow Debug Mode: %d", shadowDebugMode);
 
             ImGui::Separator();
@@ -2896,8 +3471,11 @@ int Run(HINSTANCE instance, int showCommand)
             const float offsetY = (std::max)(0.0f, (avail.y - imageHeight) * 0.5f);
             ImGui::SetCursorPos(ImVec2(cursorPos.x + offsetX, cursorPos.y + offsetY));
 
+            const bool useFsaaPreview = runtimeAaMode == AntiAliasingMode::Fsaa;
+            ID3D11ShaderResourceView* gameViewPreview = useFsaaPreview ? fsaaShaderResourceView.Get() : gameViewShaderResourceView.Get();
+
             ImGui::Image(
-                static_cast<ImTextureID>(gameViewShaderResourceView.Get()),
+                static_cast<ImTextureID>(gameViewPreview),
                 ImVec2(imageWidth, imageHeight),
                 ImVec2(0.0f, 0.0f),
                 ImVec2(1.0f, 1.0f));
@@ -2953,6 +3531,10 @@ int Run(HINSTANCE instance, int showCommand)
                     ImGui::Checkbox("Visible", &renderer.visible);
                     ImGui::Checkbox("Cast Shadows", &renderer.castsShadow);
                     ImGui::Checkbox("Use Texture", &renderer.useTexture);
+                    if (selectedObject->GetMeshType() == MeshType::Model)
+                    {
+                        ImGui::SliderFloat("Albedo Intensity", &renderer.albedoIntensity, 0.1f, 4.0f, "%.2f");
+                    }
                     ImGui::ColorEdit3("Material Color", &renderer.materialColor.x);
                 }
             }
@@ -2962,11 +3544,14 @@ int Run(HINSTANCE instance, int showCommand)
 
         if (uiChanged)
         {
+            runtimeFsaaEdgeThreshold = clampRange(runtimeFsaaEdgeThreshold, 0.0312f, 0.2500f);
+            runtimeShadowDarkness = clampRange(runtimeShadowDarkness, 0.0f, 1.0f);
+            runtimeAmbientTerm = clampRange(runtimeAmbientTerm, 0.0f, 3.0f);
             runtimePcssSearchRadius = clampRange(runtimePcssSearchRadius, 1.0f / static_cast<float>(kShadowMapSize), 0.05f);
             runtimePcssMaxFilterRadius = clampRange(runtimePcssMaxFilterRadius, runtimePcssSearchRadius, 0.20f);
             updateWindowTitle(
                 shadowDebugMode,
-                runtimeMsaaEnabled,
+                runtimeAaMode,
                 msaaSupported,
                 runtimePcssEnabled,
                 runtimePcssSearchRadius,
@@ -3126,8 +3711,8 @@ int Run(HINSTANCE instance, int showCommand)
             directionalColor.y,
             directionalColor.z,
             directionalIntensity);
-        frameData.ambientColor = XMFLOAT4(0.15f, 0.15f, 0.18f, 1.0f);
-        frameData.lightingParams = XMFLOAT4(32.0f, 0.0035f, static_cast<float>(shadowDebugMode), 0.0f);
+        frameData.ambientColor = XMFLOAT4(0.15f, 0.15f, 0.18f, runtimeAmbientTerm);
+        frameData.lightingParams = XMFLOAT4(32.0f, 0.0035f, static_cast<float>(shadowDebugMode), runtimeShadowDarkness);
         frameData.shadowParams = XMFLOAT4(
             1.0f / static_cast<float>(kShadowMapSize),
             runtimePcssSearchRadius,
@@ -3189,7 +3774,11 @@ int Run(HINSTANCE instance, int showCommand)
                         XMStoreFloat4x4(&objectData.world, XMMatrixTranspose(item.world));
                         XMStoreFloat4x4(&objectData.worldInverseTranspose, item.worldInverseTranspose);
                         objectData.materialColor = mesh.materialColor;
-                        objectData.materialParams = XMFLOAT4(mesh.hasTexture ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+                        objectData.materialParams = XMFLOAT4(
+                            mesh.hasTexture ? 1.0f : 0.0f,
+                            item.gameObject->GetRenderer().albedoIntensity,
+                            0.0f,
+                            0.0f);
 
                         context->UpdateSubresource(objectBuffer.Get(), 0, nullptr, &objectData, 0, 0);
                         context->VSSetConstantBuffers(1, 1, objectBuffer.GetAddressOf());
@@ -3212,7 +3801,11 @@ int Run(HINSTANCE instance, int showCommand)
                 XMStoreFloat4x4(&objectData.world, XMMatrixTranspose(item.world));
                 XMStoreFloat4x4(&objectData.worldInverseTranspose, item.worldInverseTranspose);
                 objectData.materialColor = item.gameObject->GetMaterialColor();
-                objectData.materialParams = XMFLOAT4(item.gameObject->UsesTexture() ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+                objectData.materialParams = XMFLOAT4(
+                    item.gameObject->UsesTexture() ? 1.0f : 0.0f,
+                    item.gameObject->GetRenderer().albedoIntensity,
+                    0.0f,
+                    0.0f);
 
                 context->UpdateSubresource(objectBuffer.Get(), 0, nullptr, &objectData, 0, 0);
                 context->VSSetConstantBuffers(1, 1, objectBuffer.GetAddressOf());
@@ -3224,14 +3817,23 @@ int Run(HINSTANCE instance, int showCommand)
             }
         }
 
-        const bool activeMsaa = msaaSupported && runtimeMsaaEnabled;
-        ID3D11RenderTargetView* activeRenderTargetView = activeMsaa ? gameViewMsaaRenderTargetView.Get() : gameViewRenderTargetView.Get();
-        ID3D11DepthStencilView* activeDepthStencilView = activeMsaa ? msaaDepthStencilView.Get() : depthStencilView.Get();
+        const bool activeMsaa = msaaSupported && runtimeAaMode == AntiAliasingMode::Msaa;
+        const bool activeFsaa = runtimeAaMode == AntiAliasingMode::Fsaa;
+        const bool activeSsaa = runtimeAaMode == AntiAliasingMode::Ssaa;
+        ID3D11RenderTargetView* activeRenderTargetView = activeMsaa ? gameViewMsaaRenderTargetView.Get() : (activeSsaa ? ssaaRenderTargetView.Get() : gameViewRenderTargetView.Get());
+        ID3D11DepthStencilView* activeDepthStencilView = activeMsaa ? msaaDepthStencilView.Get() : (activeSsaa ? ssaaDepthStencilView.Get() : depthStencilView.Get());
+
+        D3D11_VIEWPORT activeSceneViewport = sceneViewport;
+        if (activeSsaa)
+        {
+            activeSceneViewport.Width = static_cast<FLOAT>(sceneRenderWidth * kSsaaScale);
+            activeSceneViewport.Height = static_cast<FLOAT>(sceneRenderHeight * kSsaaScale);
+        }
 
         const float clearColor[] = {0.06f, 0.10f, 0.16f, 1.0f};
         context->RSSetState(nullptr);
         context->OMSetRenderTargets(1, &activeRenderTargetView, activeDepthStencilView);
-        context->RSSetViewports(1, &sceneViewport);
+        context->RSSetViewports(1, &activeSceneViewport);
         context->ClearRenderTargetView(activeRenderTargetView, clearColor);
         context->ClearDepthStencilView(activeDepthStencilView, D3D11_CLEAR_DEPTH, 1.0f, 0);
 
@@ -3241,6 +3843,16 @@ int Run(HINSTANCE instance, int showCommand)
         context->PSSetShader(scenePixelShader.Get(), nullptr, 0);
         context->VSSetConstantBuffers(0, 1, frameBuffer.GetAddressOf());
         context->PSSetConstantBuffers(0, 1, frameBuffer.GetAddressOf());
+
+        PointLightBufferData pointLightData{};
+        pointLightData.params = XMFLOAT4(static_cast<float>(runtimePointLights.size()), 0.0f, 0.0f, 0.0f);
+        for (int i = 0; i < static_cast<int>(runtimePointLights.size()); ++i)
+        {
+            pointLightData.lights[i].position = XMFLOAT4(runtimePointLights[i].position.x, runtimePointLights[i].position.y, runtimePointLights[i].position.z, runtimePointLights[i].range);
+            pointLightData.lights[i].color = XMFLOAT4(runtimePointLights[i].color.x, runtimePointLights[i].color.y, runtimePointLights[i].color.z, runtimePointLights[i].intensity);
+        }
+        context->UpdateSubresource(pointLightBuffer.Get(), 0, nullptr, &pointLightData, 0, 0);
+        context->PSSetConstantBuffers(2, 1, pointLightBuffer.GetAddressOf());
 
         ID3D11ShaderResourceView* sceneSrvs[] = {
             nullptr,
@@ -3268,7 +3880,11 @@ int Run(HINSTANCE instance, int showCommand)
                     XMStoreFloat4x4(&objectData.world, XMMatrixTranspose(item.world));
                     XMStoreFloat4x4(&objectData.worldInverseTranspose, item.worldInverseTranspose);
                     objectData.materialColor = mesh.materialColor;
-                    objectData.materialParams = XMFLOAT4(mesh.hasTexture ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+                    objectData.materialParams = XMFLOAT4(
+                        mesh.hasTexture ? 1.0f : 0.0f,
+                        item.gameObject->GetRenderer().albedoIntensity,
+                        0.0f,
+                        0.0f);
 
                     ID3D11ShaderResourceView* drawSrvs[] = {
                         mesh.hasTexture && mesh.texture ? mesh.texture.Get() : nullptr,
@@ -3299,7 +3915,11 @@ int Run(HINSTANCE instance, int showCommand)
             XMStoreFloat4x4(&objectData.world, XMMatrixTranspose(item.world));
             XMStoreFloat4x4(&objectData.worldInverseTranspose, item.worldInverseTranspose);
             objectData.materialColor = item.gameObject->GetMaterialColor();
-            objectData.materialParams = XMFLOAT4(item.gameObject->UsesTexture() ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+            objectData.materialParams = XMFLOAT4(
+                item.gameObject->UsesTexture() ? 1.0f : 0.0f,
+                item.gameObject->GetRenderer().albedoIntensity,
+                0.0f,
+                0.0f);
 
             context->UpdateSubresource(objectBuffer.Get(), 0, nullptr, &objectData, 0, 0);
             context->VSSetConstantBuffers(1, 1, objectBuffer.GetAddressOf());
@@ -3375,6 +3995,68 @@ int Run(HINSTANCE instance, int showCommand)
         if (activeMsaa)
         {
             context->ResolveSubresource(gameViewColorBuffer.Get(), 0, gameViewMsaaColorBuffer.Get(), 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+        }
+
+        if (activeSsaa)
+        {
+            FxaaBufferData ssaaData{};
+            ssaaData.params = XMFLOAT4(
+                1.0f / static_cast<float>(sceneRenderWidth * kSsaaScale),
+                1.0f / static_cast<float>(sceneRenderHeight * kSsaaScale),
+                0.0f,
+                0.0f);
+            context->UpdateSubresource(ssaaBuffer.Get(), 0, nullptr, &ssaaData, 0, 0);
+
+            ID3D11RenderTargetView* ssaaTarget = gameViewRenderTargetView.Get();
+            context->OMSetRenderTargets(1, &ssaaTarget, nullptr);
+            context->RSSetViewports(1, &sceneViewport);
+            context->IASetInputLayout(nullptr);
+            context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            context->VSSetShader(fxaaVertexShader.Get(), nullptr, 0);
+            context->PSSetShader(ssaaPixelShader.Get(), nullptr, 0);
+            context->VSSetConstantBuffers(0, 0, nullptr);
+            context->PSSetConstantBuffers(0, 1, ssaaBuffer.GetAddressOf());
+
+            ID3D11ShaderResourceView* ssaaInputSrvs[] = {ssaaShaderResourceView.Get()};
+            context->PSSetShaderResources(0, 1, ssaaInputSrvs);
+
+            ID3D11SamplerState* ssaaSamplers[] = {ssaaSampler.Get()};
+            context->PSSetSamplers(0, 1, ssaaSamplers);
+            context->Draw(4, 0);
+
+            ID3D11ShaderResourceView* nullSsaaSrvs[] = {nullptr};
+            context->PSSetShaderResources(0, 1, nullSsaaSrvs);
+        }
+
+        if (activeFsaa)
+        {
+            FxaaBufferData fxaaData{};
+            fxaaData.params = XMFLOAT4(
+                1.0f / static_cast<float>(sceneRenderWidth),
+                1.0f / static_cast<float>(sceneRenderHeight),
+                runtimeFsaaEdgeThreshold,
+                0.0f);
+            context->UpdateSubresource(fxaaBuffer.Get(), 0, nullptr, &fxaaData, 0, 0);
+
+            ID3D11RenderTargetView* fsaaTarget = fsaaRenderTargetView.Get();
+            context->OMSetRenderTargets(1, &fsaaTarget, nullptr);
+            context->RSSetViewports(1, &sceneViewport);
+            context->IASetInputLayout(nullptr);
+            context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            context->VSSetShader(fxaaVertexShader.Get(), nullptr, 0);
+            context->PSSetShader(fxaaPixelShader.Get(), nullptr, 0);
+            context->VSSetConstantBuffers(0, 0, nullptr);
+            context->PSSetConstantBuffers(0, 1, fxaaBuffer.GetAddressOf());
+
+            ID3D11ShaderResourceView* fsaaInputSrvs[] = {gameViewShaderResourceView.Get()};
+            context->PSSetShaderResources(0, 1, fsaaInputSrvs);
+
+            ID3D11SamplerState* fsaaSamplers[] = {fsaaSampler.Get()};
+            context->PSSetSamplers(0, 1, fsaaSamplers);
+            context->Draw(4, 0);
+
+            ID3D11ShaderResourceView* nullFsaaSrvs[] = {nullptr};
+            context->PSSetShaderResources(0, 1, nullFsaaSrvs);
         }
 
         const float uiClearColor[] = {0.10f, 0.10f, 0.12f, 1.0f};
