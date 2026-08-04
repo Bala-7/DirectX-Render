@@ -191,6 +191,8 @@ struct RendererComponent
     bool useTexture = false;
     bool visible = true;
     bool castsShadow = true;
+    std::string texturePath;
+    ComPtr<ID3D11ShaderResourceView> textureSrv;
 };
 
 class GameObject
@@ -1664,7 +1666,7 @@ int Run(HINSTANCE instance, int showCommand)
                 totalLight += ((diffusePL * albedo) + specularPL.xxx) * pointLights[i].color.rgb * pointLights[i].color.a * attenuationPL * rangeFadePL * rangeFadePL;
             }
 
-            return float4(saturate(totalLight), 1.0f);
+            return float4(saturate(totalLight), materialColor.a);
         }
     )";
 
@@ -1693,6 +1695,31 @@ int Run(HINSTANCE instance, int showCommand)
         {
             float4 worldPosition = mul(float4(input.position, 1.0f), world);
             return mul(worldPosition, lightViewProjection);
+        }
+    )";
+
+    // Clips shadow fragments via Bayer dithering so shadow density tracks material alpha
+    const char shadowPixelShaderSource[] = R"(
+        cbuffer ObjectBuffer : register(b1)
+        {
+            float4x4 world;
+            float4x4 worldInverseTranspose;
+            float4 materialColor;
+            float4 materialParams;
+        };
+
+        void main(float4 pos : SV_POSITION)
+        {
+            float alpha = materialColor.w;
+            if (alpha >= 1.0f) return;
+            static const float bayer[16] = {
+                 0.0f/16.0f,  8.0f/16.0f,  2.0f/16.0f, 10.0f/16.0f,
+                12.0f/16.0f,  4.0f/16.0f, 14.0f/16.0f,  6.0f/16.0f,
+                 3.0f/16.0f, 11.0f/16.0f,  1.0f/16.0f,  9.0f/16.0f,
+                15.0f/16.0f,  7.0f/16.0f, 13.0f/16.0f,  5.0f/16.0f
+            };
+            int2 pixel = int2(pos.xy) & 3;
+            clip(alpha - bayer[pixel.y * 4 + pixel.x]);
         }
     )";
 
@@ -1943,6 +1970,7 @@ int Run(HINSTANCE instance, int showCommand)
     ComPtr<ID3DBlob> sceneVertexShaderBytecode;
     ComPtr<ID3DBlob> scenePixelShaderBytecode;
     ComPtr<ID3DBlob> shadowVertexShaderBytecode;
+    ComPtr<ID3DBlob> shadowPixelShaderBytecode;
     ComPtr<ID3DBlob> debugVertexShaderBytecode;
     ComPtr<ID3DBlob> debugPixelShaderBytecode;
     ComPtr<ID3DBlob> fxaaVertexShaderBytecode;
@@ -2047,6 +2075,27 @@ int Run(HINSTANCE instance, int showCommand)
         shaderCompileFlags,
         0,
         &shadowVertexShaderBytecode,
+        &errorBlob);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    result = D3DCompile(
+        shadowPixelShaderSource,
+        sizeof(shadowPixelShaderSource) - 1,
+        nullptr,
+        nullptr,
+        nullptr,
+        "main",
+        "ps_5_0",
+        shaderCompileFlags,
+        0,
+        &shadowPixelShaderBytecode,
         &errorBlob);
     if (FAILED(result))
     {
@@ -2198,6 +2247,21 @@ int Run(HINSTANCE instance, int showCommand)
         shadowVertexShaderBytecode->GetBufferSize(),
         nullptr,
         &shadowVertexShader);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    ComPtr<ID3D11PixelShader> shadowPixelShader;
+    result = device->CreatePixelShader(
+        shadowPixelShaderBytecode->GetBufferPointer(),
+        shadowPixelShaderBytecode->GetBufferSize(),
+        nullptr,
+        &shadowPixelShader);
     if (FAILED(result))
     {
         if (shouldUninitializeCom)
@@ -2591,6 +2655,12 @@ int Run(HINSTANCE instance, int showCommand)
         }
     }
 
+    GameObject& glassBox = sceneGraph.CreateGameObject("Glass Box", MeshType::Cube);
+    glassBox.SetPosition(XMFLOAT3(0.0f, 0.5f, 0.0f));
+    glassBox.SetScale(XMFLOAT3(1.5f, 1.5f, 1.5f));
+    glassBox.SetMaterialColor(XMFLOAT4(0.3f, 0.7f, 1.0f, 0.35f));
+    glassBox.SetCastsShadow(false);
+
     D3D11_BUFFER_DESC frameBufferDesc{};
     frameBufferDesc.ByteWidth = sizeof(FrameBufferData);
     frameBufferDesc.Usage = D3D11_USAGE_DEFAULT;
@@ -2759,6 +2829,36 @@ int Run(HINSTANCE instance, int showCommand)
             CoUninitialize();
         }
         return -1;
+    }
+
+    // 64×64 grey/white checkerboard used as the default texture for primitives
+    ComPtr<ID3D11ShaderResourceView> defaultCheckerboardSrv;
+    {
+        constexpr int kSize = 64;
+        constexpr int kTile = 8;
+        std::vector<std::uint32_t> pixels(kSize * kSize);
+        for (int y = 0; y < kSize; ++y)
+            for (int x = 0; x < kSize; ++x)
+                pixels[y * kSize + x] = ((x / kTile + y / kTile) % 2 == 0) ? 0xFFCCCCCC : 0xFF888888;
+
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = kSize;
+        td.Height = kSize;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA sd{};
+        sd.pSysMem = pixels.data();
+        sd.SysMemPitch = kSize * 4;
+
+        ComPtr<ID3D11Texture2D> tex;
+        device->CreateTexture2D(&td, &sd, &tex);
+        if (tex)
+            device->CreateShaderResourceView(tex.Get(), nullptr, &defaultCheckerboardSrv);
     }
 
     D3D11_SAMPLER_DESC fsaaSamplerDesc{};
@@ -2933,6 +3033,44 @@ int Run(HINSTANCE instance, int showCommand)
         return -1;
     }
 
+    D3D11_BLEND_DESC alphaBlendDesc{};
+    alphaBlendDesc.RenderTarget[0].BlendEnable           = TRUE;
+    alphaBlendDesc.RenderTarget[0].SrcBlend              = D3D11_BLEND_SRC_ALPHA;
+    alphaBlendDesc.RenderTarget[0].DestBlend             = D3D11_BLEND_INV_SRC_ALPHA;
+    alphaBlendDesc.RenderTarget[0].BlendOp               = D3D11_BLEND_OP_ADD;
+    alphaBlendDesc.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ZERO;
+    alphaBlendDesc.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_ONE;
+    alphaBlendDesc.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
+    alphaBlendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+
+    ComPtr<ID3D11BlendState> alphaBlendState;
+    result = device->CreateBlendState(&alphaBlendDesc, &alphaBlendState);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    D3D11_DEPTH_STENCIL_DESC transparentDsDesc{};
+    transparentDsDesc.DepthEnable    = TRUE;
+    transparentDsDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    transparentDsDesc.DepthFunc      = D3D11_COMPARISON_LESS;
+    transparentDsDesc.StencilEnable  = FALSE;
+
+    ComPtr<ID3D11DepthStencilState> transparentDepthState;
+    result = device->CreateDepthStencilState(&transparentDsDesc, &transparentDepthState);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    };
+
     D3D11_VIEWPORT sceneViewport{};
     sceneViewport.TopLeftX = 0.0f;
     sceneViewport.TopLeftY = 0.0f;
@@ -3087,6 +3225,8 @@ int Run(HINSTANCE instance, int showCommand)
             file << "OBJECT_SCALE "    << t.scale.x    << " " << t.scale.y    << " " << t.scale.z    << "\n";
             file << "OBJECT_COLOR "    << r.materialColor.x << " " << r.materialColor.y << " " << r.materialColor.z << " " << r.materialColor.w << "\n";
             file << "OBJECT_ALBEDO "   << r.albedoIntensity << "\n";
+            if (!r.texturePath.empty())
+                file << "OBJECT_TEXTURE_PATH " << r.texturePath << "\n";
         }
         currentScenePath = path;
     };
@@ -3108,6 +3248,7 @@ int Run(HINSTANCE instance, int showCommand)
             XMFLOAT3 scale{1.0f, 1.0f, 1.0f};
             XMFLOAT4 color{1.0f, 1.0f, 1.0f, 1.0f};
             float albedoIntensity = 1.6f;
+            std::string texturePath;
         };
 
         float newDirYaw          = directionalYaw;
@@ -3169,6 +3310,12 @@ int Run(HINSTANCE instance, int showCommand)
             else if (kw == "OBJECT_SCALE"    && current) { ss >> current->scale.x    >> current->scale.y    >> current->scale.z; }
             else if (kw == "OBJECT_COLOR"    && current) { ss >> current->color.x    >> current->color.y    >> current->color.z    >> current->color.w; }
             else if (kw == "OBJECT_ALBEDO"   && current) { ss >> current->albedoIntensity; }
+            else if (kw == "OBJECT_TEXTURE_PATH" && current)
+            {
+                std::getline(ss, current->texturePath);
+                if (!current->texturePath.empty() && current->texturePath.front() == ' ')
+                    current->texturePath = current->texturePath.substr(1);
+            }
         }
 
         // Apply parsed values
@@ -3213,6 +3360,9 @@ int Run(HINSTANCE instance, int showCommand)
                     r.useTexture      = obj->useTexture;
                     r.visible         = obj->visible;
                     r.castsShadow     = obj->castsShadow;
+                    r.texturePath     = obj->texturePath;
+                    if (!r.texturePath.empty())
+                        LoadTextureFromImageFile(device.Get(), r.texturePath, r.textureSrv);
                     created.SetModelId(obj->modelId);
                     progress = true;
                 }
@@ -3818,11 +3968,8 @@ int Run(HINSTANCE instance, int showCommand)
                     ImGui::Checkbox("Visible", &renderer.visible);
                     ImGui::Checkbox("Cast Shadows", &renderer.castsShadow);
                     ImGui::Checkbox("Use Texture", &renderer.useTexture);
-                    if (selectedObject->GetMeshType() == MeshType::Model)
-                    {
-                        ImGui::SliderFloat("Albedo Intensity", &renderer.albedoIntensity, 0.1f, 4.0f, "%.2f");
-                    }
-                    ImGui::ColorEdit3("Material Color", &renderer.materialColor.x);
+                    ImGui::SliderFloat("Albedo Intensity", &renderer.albedoIntensity, 0.1f, 4.0f, "%.2f");
+                    ImGui::ColorEdit4("Material Color", &renderer.materialColor.x);
                 }
             }
             ImGui::EndChild();
@@ -4014,8 +4161,9 @@ int Run(HINSTANCE instance, int showCommand)
         context->IASetInputLayout(inputLayout.Get());
         context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         context->VSSetShader(shadowVertexShader.Get(), nullptr, 0);
-        context->PSSetShader(nullptr, nullptr, 0);
+        context->PSSetShader(shadowPixelShader.Get(), nullptr, 0);
         context->VSSetConstantBuffers(1, 1, objectBuffer.GetAddressOf());
+        context->PSSetConstantBuffers(1, 1, objectBuffer.GetAddressOf());
         context->RSSetState(shadowRasterizerState.Get());
         context->RSSetViewports(1, &shadowViewport);
 
@@ -4151,14 +4299,14 @@ int Run(HINSTANCE instance, int showCommand)
         ID3D11SamplerState* samplers[] = {textureSampler.Get(), shadowSampler.Get(), shadowDepthSampler.Get()};
         context->PSSetSamplers(0, 3, samplers);
 
-        for (const RenderItem& item : renderItems)
+        auto drawSceneItem = [&](const RenderItem& item)
         {
             if (item.gameObject->GetMeshType() == MeshType::Model)
             {
                 const ModelResource* model = getModelById(item.gameObject->GetModelId());
                 if (model == nullptr)
                 {
-                    continue;
+                    return;
                 }
 
                 for (const ModelMesh& mesh : model->meshes)
@@ -4167,6 +4315,8 @@ int Run(HINSTANCE instance, int showCommand)
                     XMStoreFloat4x4(&objectData.world, XMMatrixTranspose(item.world));
                     XMStoreFloat4x4(&objectData.worldInverseTranspose, item.worldInverseTranspose);
                     objectData.materialColor = mesh.materialColor;
+                    // Override alpha with the game object's alpha so transparency works on models
+                    objectData.materialColor.w = item.gameObject->GetMaterialColor().w;
                     objectData.materialParams = XMFLOAT4(
                         mesh.hasTexture ? 1.0f : 0.0f,
                         item.gameObject->GetRenderer().albedoIntensity,
@@ -4189,24 +4339,35 @@ int Run(HINSTANCE instance, int showCommand)
                     context->IASetIndexBuffer(mesh.indexBuffer.Get(), DXGI_FORMAT_R32_UINT, 0);
                     context->DrawIndexed(mesh.indexCount, 0, 0);
                 }
-                continue;
+                return;
             }
 
             const MeshRenderData* mesh = getMeshRenderData(item.gameObject->GetMeshType());
             if (mesh == nullptr)
             {
-                continue;
+                return;
             }
 
             ObjectBufferData objectData{};
             XMStoreFloat4x4(&objectData.world, XMMatrixTranspose(item.world));
             XMStoreFloat4x4(&objectData.worldInverseTranspose, item.worldInverseTranspose);
             objectData.materialColor = item.gameObject->GetMaterialColor();
+            ID3D11ShaderResourceView* primTexSrv = item.gameObject->GetRenderer().textureSrv
+                ? item.gameObject->GetRenderer().textureSrv.Get()
+                : defaultCheckerboardSrv.Get();
+            const bool useTexForPrim = item.gameObject->UsesTexture();
             objectData.materialParams = XMFLOAT4(
-                item.gameObject->UsesTexture() ? 1.0f : 0.0f,
+                useTexForPrim ? 1.0f : 0.0f,
                 item.gameObject->GetRenderer().albedoIntensity,
                 0.0f,
                 0.0f);
+
+            ID3D11ShaderResourceView* primSrvs[] = {
+                useTexForPrim ? primTexSrv : nullptr,
+                shadowShaderViews[0].Get(),
+                shadowShaderViews[1].Get(),
+                shadowShaderViews[2].Get()};
+            context->PSSetShaderResources(0, 4, primSrvs);
 
             context->UpdateSubresource(objectBuffer.Get(), 0, nullptr, &objectData, 0, 0);
             context->VSSetConstantBuffers(1, 1, objectBuffer.GetAddressOf());
@@ -4216,38 +4377,94 @@ int Run(HINSTANCE instance, int showCommand)
             context->IASetVertexBuffers(0, 1, &vertexBuffer, &mesh->stride, &mesh->offset);
             context->IASetIndexBuffer(mesh->indexBuffer, DXGI_FORMAT_R16_UINT, 0);
             context->DrawIndexed(mesh->indexCount, 0, 0);
+        };
+
+        // Classify render items into opaque and transparent
+        std::vector<const RenderItem*> opaqueItems;
+        std::vector<std::pair<float, const RenderItem*>> transparentItems;
+        for (const RenderItem& item : renderItems)
+        {
+            if (item.gameObject->GetMaterialColor().w < 1.0f)
+            {
+                const XMVECTOR objPos = item.world.r[3];
+                const XMVECTOR camVec = XMLoadFloat3(&cameraPosition);
+                const float distSq = XMVectorGetX(XMVector3LengthSq(XMVectorSubtract(objPos, camVec)));
+                transparentItems.push_back({distSq, &item});
+            }
+            else
+            {
+                opaqueItems.push_back(&item);
+            }
         }
 
-        XMMATRIX skyboxView = view;
-        skyboxView.r[3] = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
-        const XMMATRIX skyboxViewProjection = skyboxView * projection;
+        // Sort transparent objects back-to-front so closer objects blend over farther ones
+        std::sort(transparentItems.begin(), transparentItems.end(),
+            [](const std::pair<float, const RenderItem*>& a, const std::pair<float, const RenderItem*>& b)
+            { return a.first > b.first; });
 
-        SkyboxFrameBufferData skyboxFrameData{};
-        XMStoreFloat4x4(&skyboxFrameData.viewProjection, XMMatrixTranspose(skyboxViewProjection));
-        context->UpdateSubresource(skyboxFrameBuffer.Get(), 0, nullptr, &skyboxFrameData, 0, 0);
+        // Draw opaque objects with default state
+        for (const RenderItem* item : opaqueItems)
+        {
+            drawSceneItem(*item);
+        }
 
-        context->RSSetState(skyboxRasterizerState.Get());
-        context->OMSetDepthStencilState(skyboxDepthStencilState.Get(), 0);
-        context->IASetInputLayout(skyboxInputLayout.Get());
-        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        context->VSSetShader(skyboxVertexShader.Get(), nullptr, 0);
-        context->PSSetShader(skyboxPixelShader.Get(), nullptr, 0);
-        context->VSSetConstantBuffers(0, 1, skyboxFrameBuffer.GetAddressOf());
-        context->PSSetConstantBuffers(0, 0, nullptr);
-        context->PSSetShaderResources(0, 1, skyboxCubemap.GetAddressOf());
-        context->PSSetSamplers(0, 1, skyboxSampler.GetAddressOf());
+        // Draw skybox after opaques so transparent objects blend against the correct background
+        {
+            XMMATRIX skyboxView = view;
+            skyboxView.r[3] = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
+            const XMMATRIX skyboxViewProjection = skyboxView * projection;
 
-        const UINT skyboxStride = sizeof(float) * 3;
-        const UINT skyboxOffset = 0;
-        ID3D11Buffer* skyboxVertexBuffers[] = {skyboxVertexBuffer.Get()};
-        context->IASetVertexBuffers(0, 1, skyboxVertexBuffers, &skyboxStride, &skyboxOffset);
-        context->IASetIndexBuffer(skyboxIndexBuffer.Get(), DXGI_FORMAT_R16_UINT, 0);
-        context->DrawIndexed(skyboxIndexCount, 0, 0);
+            SkyboxFrameBufferData skyboxFrameData{};
+            XMStoreFloat4x4(&skyboxFrameData.viewProjection, XMMatrixTranspose(skyboxViewProjection));
+            context->UpdateSubresource(skyboxFrameBuffer.Get(), 0, nullptr, &skyboxFrameData, 0, 0);
 
-        context->OMSetDepthStencilState(nullptr, 0);
-        context->RSSetState(nullptr);
-        ID3D11ShaderResourceView* nullSkyboxSrv[1] = {nullptr};
-        context->PSSetShaderResources(0, 1, nullSkyboxSrv);
+            context->RSSetState(skyboxRasterizerState.Get());
+            context->OMSetDepthStencilState(skyboxDepthStencilState.Get(), 0);
+            context->IASetInputLayout(skyboxInputLayout.Get());
+            context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context->VSSetShader(skyboxVertexShader.Get(), nullptr, 0);
+            context->PSSetShader(skyboxPixelShader.Get(), nullptr, 0);
+            context->VSSetConstantBuffers(0, 1, skyboxFrameBuffer.GetAddressOf());
+            context->PSSetConstantBuffers(0, 0, nullptr);
+            context->PSSetShaderResources(0, 1, skyboxCubemap.GetAddressOf());
+            context->PSSetSamplers(0, 1, skyboxSampler.GetAddressOf());
+
+            const UINT skyboxStride = sizeof(float) * 3;
+            const UINT skyboxOffset = 0;
+            ID3D11Buffer* skyboxVertexBuffers[] = {skyboxVertexBuffer.Get()};
+            context->IASetVertexBuffers(0, 1, skyboxVertexBuffers, &skyboxStride, &skyboxOffset);
+            context->IASetIndexBuffer(skyboxIndexBuffer.Get(), DXGI_FORMAT_R16_UINT, 0);
+            context->DrawIndexed(skyboxIndexCount, 0, 0);
+
+            context->OMSetDepthStencilState(nullptr, 0);
+            context->RSSetState(nullptr);
+            ID3D11ShaderResourceView* nullSkyboxSrv[1] = {nullptr};
+            context->PSSetShaderResources(0, 1, nullSkyboxSrv);
+
+            // Restore scene shader state for the transparent pass
+            context->IASetInputLayout(inputLayout.Get());
+            context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context->VSSetShader(sceneVertexShader.Get(), nullptr, 0);
+            context->PSSetShader(scenePixelShader.Get(), nullptr, 0);
+            context->VSSetConstantBuffers(0, 1, frameBuffer.GetAddressOf());
+            context->PSSetConstantBuffers(0, 1, frameBuffer.GetAddressOf());
+            context->PSSetConstantBuffers(2, 1, pointLightBuffer.GetAddressOf());
+            ID3D11SamplerState* sceneSamplers[] = {textureSampler.Get(), shadowSampler.Get(), shadowDepthSampler.Get()};
+            context->PSSetSamplers(0, 3, sceneSamplers);
+        }
+
+        // Draw transparent objects: depth test on, depth write off, alpha blending
+        if (!transparentItems.empty())
+        {
+            context->OMSetBlendState(alphaBlendState.Get(), nullptr, 0xFFFFFFFF);
+            context->OMSetDepthStencilState(transparentDepthState.Get(), 0);
+            for (const std::pair<float, const RenderItem*>& kv : transparentItems)
+            {
+                drawSceneItem(*kv.second);
+            }
+            context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+            context->OMSetDepthStencilState(nullptr, 0);
+        }
 
         if (shadowDebugMode > 0)
         {
