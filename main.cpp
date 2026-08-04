@@ -3119,6 +3119,7 @@ int Run(HINSTANCE instance, int showCommand)
     int shadowDebugMode = 0;
     bool debugToggleWasDown = false;
     bool wasCapturingMouseLook = false;
+    bool showControlsWindow = false;
     AntiAliasingMode runtimeAaMode = msaaSupported ? AntiAliasingMode::Msaa : AntiAliasingMode::None;
     bool runtimePcssEnabled = true;
     float runtimePcssSearchRadius = 0.0016f;
@@ -3631,6 +3632,8 @@ int Run(HINSTANCE instance, int showCommand)
             }
             if (ImGui::BeginMenu("Help"))
             {
+                if (ImGui::MenuItem("Controls"))
+                    showControlsWindow = true;
                 ImGui::EndMenu();
             }
             ImGui::EndMainMenuBar();
@@ -3975,6 +3978,35 @@ int Run(HINSTANCE instance, int showCommand)
             ImGui::EndChild();
         }
         ImGui::End();
+
+        if (showControlsWindow)
+        {
+            ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_Appearing);
+            ImGui::SetNextWindowPos(
+                ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f),
+                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            if (ImGui::Begin("Controls", &showControlsWindow, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize))
+            {
+                ImGui::SeparatorText("Camera");
+                ImGui::Text("W / A / S / D          Move forward / left / back / right");
+                ImGui::Text("Right Mouse + Drag     Look around");
+
+                ImGui::SeparatorText("Directional Light");
+                ImGui::Text("Arrow Keys             Rotate yaw / pitch");
+                ImGui::Text("U / J                  Red channel  +  / -");
+                ImGui::Text("I / K                  Green channel  +  / -");
+                ImGui::Text("O / L                  Blue channel  +  / -");
+                ImGui::Text("P / N                  Intensity  +  / -");
+
+                ImGui::SeparatorText("Debug");
+                ImGui::Text("M                      Cycle shadow debug mode");
+
+                ImGui::Spacing();
+                if (ImGui::Button("Close", ImVec2(-1.0f, 0.0f)))
+                    showControlsWindow = false;
+            }
+            ImGui::End();
+        }
 
         if (uiChanged)
         {
