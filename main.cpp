@@ -105,6 +105,12 @@ struct FxaaBufferData
     XMFLOAT4 params;
 };
 
+struct DofBufferData
+{
+    XMFLOAT4 focusParams;  // x: focusDistance, y: focusRange, z: blurRadiusPixels, w: unused
+    XMFLOAT4 nearFarTexel; // x: nearZ, y: farZ, z: texelWidth, w: texelHeight
+};
+
 struct SkyboxFrameBufferData
 {
     XMFLOAT4X4 viewProjection;
@@ -1160,6 +1166,12 @@ int Run(HINSTANCE instance, int showCommand)
     ComPtr<ID3D11Texture2D> msaaDepthBuffer;
     ComPtr<ID3D11DepthStencilView> msaaDepthStencilView;
     ComPtr<ID3D11DepthStencilView> depthStencilView;
+    ComPtr<ID3D11Texture2D> dofDepthBuffer;
+    ComPtr<ID3D11DepthStencilView> dofDepthStencilView;
+    ComPtr<ID3D11ShaderResourceView> dofDepthShaderResourceView;
+    ComPtr<ID3D11Texture2D> dofColorBuffer;
+    ComPtr<ID3D11RenderTargetView> dofRenderTargetView;
+    ComPtr<ID3D11ShaderResourceView> dofShaderResourceView;
 
     auto createSizeDependentResources = [&](UINT width, UINT height) -> bool
     {
@@ -1324,6 +1336,64 @@ int Run(HINSTANCE instance, int showCommand)
         }
 
         createResult = device->CreateDepthStencilView(depthBuffer.Get(), nullptr, &depthStencilView);
+        if (FAILED(createResult))
+        {
+            return false;
+        }
+
+        // Single-sample native-resolution depth used only for the Depth of Field prepass
+        D3D11_TEXTURE2D_DESC dofDepthDesc{};
+        dofDepthDesc.Width = width;
+        dofDepthDesc.Height = height;
+        dofDepthDesc.MipLevels = 1;
+        dofDepthDesc.ArraySize = 1;
+        dofDepthDesc.Format = DXGI_FORMAT_R24G8_TYPELESS;
+        dofDepthDesc.SampleDesc.Count = 1;
+        dofDepthDesc.SampleDesc.Quality = 0;
+        dofDepthDesc.Usage = D3D11_USAGE_DEFAULT;
+        dofDepthDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+
+        createResult = device->CreateTexture2D(&dofDepthDesc, nullptr, &dofDepthBuffer);
+        if (FAILED(createResult))
+        {
+            return false;
+        }
+
+        D3D11_DEPTH_STENCIL_VIEW_DESC dofDsvDesc{};
+        dofDsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dofDsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+
+        createResult = device->CreateDepthStencilView(dofDepthBuffer.Get(), &dofDsvDesc, &dofDepthStencilView);
+        if (FAILED(createResult))
+        {
+            return false;
+        }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC dofSrvDesc{};
+        dofSrvDesc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        dofSrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        dofSrvDesc.Texture2D.MostDetailedMip = 0;
+        dofSrvDesc.Texture2D.MipLevels = 1;
+
+        createResult = device->CreateShaderResourceView(dofDepthBuffer.Get(), &dofSrvDesc, &dofDepthShaderResourceView);
+        if (FAILED(createResult))
+        {
+            return false;
+        }
+
+        createResult = device->CreateTexture2D(&gameViewDesc, nullptr, &dofColorBuffer);
+        if (FAILED(createResult))
+        {
+            return false;
+        }
+
+        createResult = device->CreateRenderTargetView(dofColorBuffer.Get(), nullptr, &dofRenderTargetView);
+        if (FAILED(createResult))
+        {
+            return false;
+        }
+
+        createResult = device->CreateShaderResourceView(dofColorBuffer.Get(), nullptr, &dofShaderResourceView);
         return SUCCEEDED(createResult);
     };
 
@@ -1723,6 +1793,87 @@ int Run(HINSTANCE instance, int showCommand)
         }
     )";
 
+    // Minimal depth-only vertex shader used for the Depth of Field prepass
+    const char depthPrepassVertexShaderSource[] = R"(
+        cbuffer FrameBuffer : register(b0)
+        {
+            float4x4 viewProjection;
+        };
+
+        cbuffer ObjectBuffer : register(b1)
+        {
+            float4x4 world;
+        };
+
+        struct VSInput
+        {
+            float3 position : POSITION;
+            float3 normal : NORMAL;
+            float2 uv : TEXCOORD0;
+        };
+
+        float4 main(VSInput input) : SV_POSITION
+        {
+            float4 worldPosition = mul(float4(input.position, 1.0f), world);
+            return mul(worldPosition, viewProjection);
+        }
+    )";
+
+    // Depth-based blur: samples widen as scene depth departs from the focus distance
+    const char dofPixelShaderSource[] = R"(
+        cbuffer DofBuffer : register(b0)
+        {
+            float4 focusParams;
+            float4 nearFarTexel;
+        };
+
+        Texture2D sceneColor : register(t0);
+        Texture2D sceneDepth : register(t1);
+        SamplerState linearSampler : register(s0);
+
+        struct PSInput
+        {
+            float4 position : SV_POSITION;
+            float2 uv : TEXCOORD0;
+        };
+
+        float4 main(PSInput input) : SV_TARGET
+        {
+            float depth = sceneDepth.Sample(linearSampler, input.uv).r;
+            float nearZ = nearFarTexel.x;
+            float farZ = nearFarTexel.y;
+            float linearDepth = (nearZ * farZ) / (farZ - depth * (farZ - nearZ));
+
+            float focusDistance = focusParams.x;
+            float focusRange = max(focusParams.y, 0.0001f);
+            float blurRadiusPixels = focusParams.z;
+
+            float coc = saturate(abs(linearDepth - focusDistance) / focusRange) * blurRadiusPixels;
+
+            float3 result = sceneColor.Sample(linearSampler, input.uv).rgb;
+            if (coc > 0.6f)
+            {
+                static const float2 kernel[12] = {
+                    float2( 0.000f,  1.000f), float2( 0.866f,  0.500f), float2( 0.866f, -0.500f),
+                    float2( 0.000f, -1.000f), float2(-0.866f, -0.500f), float2(-0.866f,  0.500f),
+                    float2( 0.000f,  0.500f), float2( 0.433f,  0.250f), float2( 0.433f, -0.250f),
+                    float2( 0.000f, -0.500f), float2(-0.433f, -0.250f), float2(-0.433f,  0.250f)
+                };
+
+                float2 texel = nearFarTexel.zw;
+                float3 sum = 0.0f;
+                [unroll]
+                for (int i = 0; i < 12; ++i)
+                {
+                    sum += sceneColor.Sample(linearSampler, input.uv + kernel[i] * coc * texel).rgb;
+                }
+                result = sum / 12.0f;
+            }
+
+            return float4(result, 1.0f);
+        }
+    )";
+
     const char debugVertexShaderSource[] = R"(
         struct VSOutput
         {
@@ -1971,6 +2122,8 @@ int Run(HINSTANCE instance, int showCommand)
     ComPtr<ID3DBlob> scenePixelShaderBytecode;
     ComPtr<ID3DBlob> shadowVertexShaderBytecode;
     ComPtr<ID3DBlob> shadowPixelShaderBytecode;
+    ComPtr<ID3DBlob> depthPrepassVertexShaderBytecode;
+    ComPtr<ID3DBlob> dofPixelShaderBytecode;
     ComPtr<ID3DBlob> debugVertexShaderBytecode;
     ComPtr<ID3DBlob> debugPixelShaderBytecode;
     ComPtr<ID3DBlob> fxaaVertexShaderBytecode;
@@ -2096,6 +2249,48 @@ int Run(HINSTANCE instance, int showCommand)
         shaderCompileFlags,
         0,
         &shadowPixelShaderBytecode,
+        &errorBlob);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    result = D3DCompile(
+        depthPrepassVertexShaderSource,
+        sizeof(depthPrepassVertexShaderSource) - 1,
+        nullptr,
+        nullptr,
+        nullptr,
+        "main",
+        "vs_5_0",
+        shaderCompileFlags,
+        0,
+        &depthPrepassVertexShaderBytecode,
+        &errorBlob);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    result = D3DCompile(
+        dofPixelShaderSource,
+        sizeof(dofPixelShaderSource) - 1,
+        nullptr,
+        nullptr,
+        nullptr,
+        "main",
+        "ps_5_0",
+        shaderCompileFlags,
+        0,
+        &dofPixelShaderBytecode,
         &errorBlob);
     if (FAILED(result))
     {
@@ -2262,6 +2457,36 @@ int Run(HINSTANCE instance, int showCommand)
         shadowPixelShaderBytecode->GetBufferSize(),
         nullptr,
         &shadowPixelShader);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    ComPtr<ID3D11VertexShader> depthPrepassVertexShader;
+    result = device->CreateVertexShader(
+        depthPrepassVertexShaderBytecode->GetBufferPointer(),
+        depthPrepassVertexShaderBytecode->GetBufferSize(),
+        nullptr,
+        &depthPrepassVertexShader);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
+    ComPtr<ID3D11PixelShader> dofPixelShader;
+    result = device->CreatePixelShader(
+        dofPixelShaderBytecode->GetBufferPointer(),
+        dofPixelShaderBytecode->GetBufferSize(),
+        nullptr,
+        &dofPixelShader);
     if (FAILED(result))
     {
         if (shouldUninitializeCom)
@@ -2773,6 +2998,22 @@ int Run(HINSTANCE instance, int showCommand)
         return -1;
     }
 
+    D3D11_BUFFER_DESC dofBufferDesc{};
+    dofBufferDesc.ByteWidth = sizeof(DofBufferData);
+    dofBufferDesc.Usage = D3D11_USAGE_DEFAULT;
+    dofBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+
+    ComPtr<ID3D11Buffer> dofBuffer;
+    result = device->CreateBuffer(&dofBufferDesc, nullptr, &dofBuffer);
+    if (FAILED(result))
+    {
+        if (shouldUninitializeCom)
+        {
+            CoUninitialize();
+        }
+        return -1;
+    }
+
     D3D11_BUFFER_DESC pointLightBufferDesc{};
     pointLightBufferDesc.ByteWidth = sizeof(PointLightBufferData);
     pointLightBufferDesc.Usage = D3D11_USAGE_DEFAULT;
@@ -3127,6 +3368,10 @@ int Run(HINSTANCE instance, int showCommand)
     float runtimeShadowDarkness = 0.5f;
     float runtimeAmbientTerm = 1.0f;
     float runtimeFsaaEdgeThreshold = 0.0833f;
+    bool runtimeDofEnabled = false;
+    float runtimeDofFocusDistance = 8.0f;
+    float runtimeDofFocusRange = 6.0f;
+    float runtimeDofBlurRadius = 6.0f;
     float directionalYaw = XMConvertToRadians(-74.0f);
     float directionalPitch = XMConvertToRadians(-53.0f);
     XMFLOAT3 directionalColor = {1.0f, 1.0f, 1.0f};
@@ -3499,6 +3744,12 @@ int Run(HINSTANCE instance, int showCommand)
             msaaDepthBuffer.Reset();
             msaaDepthStencilView.Reset();
             depthStencilView.Reset();
+            dofDepthBuffer.Reset();
+            dofDepthStencilView.Reset();
+            dofDepthShaderResourceView.Reset();
+            dofColorBuffer.Reset();
+            dofRenderTargetView.Reset();
+            dofShaderResourceView.Reset();
 
             const HRESULT resizeResult = swapChain->ResizeBuffers(0, clientWidth, clientHeight, DXGI_FORMAT_UNKNOWN, 0);
             if (FAILED(resizeResult) || !createSizeDependentResources(clientWidth, clientHeight))
@@ -3719,34 +3970,34 @@ int Run(HINSTANCE instance, int showCommand)
                 ImGui::Unindent(14.0f);
             }
 
-            bool uiPcss = runtimePcssEnabled;
-            if (ImGui::Checkbox("PCSS Soft Shadows", &uiPcss))
+            if (ImGui::CollapsingHeader("Shadows", ImGuiTreeNodeFlags_DefaultOpen))
             {
-                runtimePcssEnabled = uiPcss;
-                uiChanged = true;
-            }
-
-            if (runtimePcssEnabled)
-            {
-                ImGui::Indent(14.0f);
-                float uiSearchRadius = runtimePcssSearchRadius;
-                if (ImGui::SliderFloat("PCSS Search Radius", &uiSearchRadius, 1.0f / static_cast<float>(kShadowMapSize), 0.05f, "%.4f"))
+                bool uiPcss = runtimePcssEnabled;
+                if (ImGui::Checkbox("PCSS Soft Shadows", &uiPcss))
                 {
-                    runtimePcssSearchRadius = uiSearchRadius;
+                    runtimePcssEnabled = uiPcss;
                     uiChanged = true;
                 }
 
-                float uiSoftRadius = runtimePcssMaxFilterRadius;
-                if (ImGui::SliderFloat("PCSS Soft Radius", &uiSoftRadius, runtimePcssSearchRadius, 0.20f, "%.4f"))
+                if (runtimePcssEnabled)
                 {
-                    runtimePcssMaxFilterRadius = uiSoftRadius;
-                    uiChanged = true;
-                }
-                ImGui::Unindent(14.0f);
-            }
+                    ImGui::Indent(14.0f);
+                    float uiSearchRadius = runtimePcssSearchRadius;
+                    if (ImGui::SliderFloat("PCSS Search Radius", &uiSearchRadius, 1.0f / static_cast<float>(kShadowMapSize), 0.05f, "%.4f"))
+                    {
+                        runtimePcssSearchRadius = uiSearchRadius;
+                        uiChanged = true;
+                    }
 
-            if (ImGui::CollapsingHeader("Lighting", ImGuiTreeNodeFlags_DefaultOpen))
-            {
+                    float uiSoftRadius = runtimePcssMaxFilterRadius;
+                    if (ImGui::SliderFloat("PCSS Soft Radius", &uiSoftRadius, runtimePcssSearchRadius, 0.20f, "%.4f"))
+                    {
+                        runtimePcssMaxFilterRadius = uiSoftRadius;
+                        uiChanged = true;
+                    }
+                    ImGui::Unindent(14.0f);
+                }
+
                 float uiShadowDarkness = runtimeShadowDarkness;
                 if (ImGui::SliderFloat("Shadow Darkness", &uiShadowDarkness, 0.0f, 1.0f, "%.2f"))
                 {
@@ -3754,12 +4005,11 @@ int Run(HINSTANCE instance, int showCommand)
                     uiChanged = true;
                 }
 
-                float uiAmbientTerm = runtimeAmbientTerm;
-                if (ImGui::SliderFloat("Ambient Term", &uiAmbientTerm, 0.0f, 3.0f, "%.2f"))
-                {
-                    runtimeAmbientTerm = uiAmbientTerm;
-                    uiChanged = true;
-                }
+                ImGui::Text("Shadow Debug Mode: %d", shadowDebugMode);
+            }
+
+            if (ImGui::CollapsingHeader("Lighting", ImGuiTreeNodeFlags_DefaultOpen))
+            {
 
                 if (ImGui::SliderAngle("Directional Yaw", &directionalYaw, -180.0f, 180.0f))
                 {
@@ -3818,7 +4068,22 @@ int Run(HINSTANCE instance, int showCommand)
                 }
             }
 
-            ImGui::Text("Shadow Debug Mode: %d", shadowDebugMode);
+            if (ImGui::CollapsingHeader("Image Processing", ImGuiTreeNodeFlags_DefaultOpen))
+            {
+                if (ImGui::Checkbox("Depth of Field", &runtimeDofEnabled))
+                {
+                    uiChanged = true;
+                }
+
+                if (runtimeDofEnabled)
+                {
+                    ImGui::Indent(14.0f);
+                    ImGui::SliderFloat("Focus Distance", &runtimeDofFocusDistance, 0.5f, 40.0f, "%.1f");
+                    ImGui::SliderFloat("Focus Range", &runtimeDofFocusRange, 0.1f, 20.0f, "%.1f");
+                    ImGui::SliderFloat("Blur Strength", &runtimeDofBlurRadius, 0.0f, 16.0f, "%.1f");
+                    ImGui::Unindent(14.0f);
+                }
+            }
 
             ImGui::Separator();
             ImGui::Text("Scene Graph (%zu objects)", sceneGraph.GetObjects().size());
@@ -3912,7 +4177,9 @@ int Run(HINSTANCE instance, int showCommand)
             ImGui::SetCursorPos(ImVec2(cursorPos.x + offsetX, cursorPos.y + offsetY));
 
             const bool useFsaaPreview = runtimeAaMode == AntiAliasingMode::Fsaa;
-            ID3D11ShaderResourceView* gameViewPreview = useFsaaPreview ? fsaaShaderResourceView.Get() : gameViewShaderResourceView.Get();
+            ID3D11ShaderResourceView* gameViewPreview = runtimeDofEnabled
+                ? dofShaderResourceView.Get()
+                : (useFsaaPreview ? fsaaShaderResourceView.Get() : gameViewShaderResourceView.Get());
 
             ImGui::Image(
                 static_cast<ImTextureID>(gameViewPreview),
@@ -4097,7 +4364,9 @@ int Run(HINSTANCE instance, int showCommand)
         XMStoreFloat3(&cameraPosition, cameraPositionVector);
 
         const float aspectRatio = static_cast<float>(sceneRenderWidth) / static_cast<float>(sceneRenderHeight);
-        const XMMATRIX projection = XMMatrixPerspectiveFovLH(XM_PIDIV4, aspectRatio, 0.1f, 100.0f);
+        const float cameraNearZ = 0.1f;
+        const float cameraFarZ = 100.0f;
+        const XMMATRIX projection = XMMatrixPerspectiveFovLH(XM_PIDIV4, aspectRatio, cameraNearZ, cameraFarZ);
         const XMMATRIX view = XMMatrixLookToLH(cameraPositionVector, forward, worldUp);
         const XMMATRIX viewProjection = view * projection;
 
@@ -4274,6 +4543,62 @@ int Run(HINSTANCE instance, int showCommand)
                     0.0f,
                     0.0f);
 
+                context->UpdateSubresource(objectBuffer.Get(), 0, nullptr, &objectData, 0, 0);
+                context->VSSetConstantBuffers(1, 1, objectBuffer.GetAddressOf());
+
+                ID3D11Buffer* vertexBuffer = mesh->vertexBuffer;
+                context->IASetVertexBuffers(0, 1, &vertexBuffer, &mesh->stride, &mesh->offset);
+                context->IASetIndexBuffer(mesh->indexBuffer, DXGI_FORMAT_R16_UINT, 0);
+                context->DrawIndexed(mesh->indexCount, 0, 0);
+            }
+        }
+
+        if (runtimeDofEnabled)
+        {
+            context->OMSetRenderTargets(0, nullptr, dofDepthStencilView.Get());
+            context->ClearDepthStencilView(dofDepthStencilView.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+            context->OMSetDepthStencilState(nullptr, 0);
+            context->RSSetState(nullptr);
+            context->RSSetViewports(1, &sceneViewport);
+            context->IASetInputLayout(inputLayout.Get());
+            context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context->VSSetShader(depthPrepassVertexShader.Get(), nullptr, 0);
+            context->PSSetShader(nullptr, nullptr, 0);
+            context->VSSetConstantBuffers(0, 1, frameBuffer.GetAddressOf());
+
+            for (const RenderItem& item : renderItems)
+            {
+                if (item.gameObject->GetMeshType() == MeshType::Model)
+                {
+                    const ModelResource* model = getModelById(item.gameObject->GetModelId());
+                    if (model == nullptr)
+                    {
+                        continue;
+                    }
+
+                    for (const ModelMesh& mesh : model->meshes)
+                    {
+                        ObjectBufferData objectData{};
+                        XMStoreFloat4x4(&objectData.world, XMMatrixTranspose(item.world));
+                        context->UpdateSubresource(objectBuffer.Get(), 0, nullptr, &objectData, 0, 0);
+                        context->VSSetConstantBuffers(1, 1, objectBuffer.GetAddressOf());
+
+                        ID3D11Buffer* vertexBuffer = mesh.vertexBuffer.Get();
+                        context->IASetVertexBuffers(0, 1, &vertexBuffer, &mesh.stride, &mesh.offset);
+                        context->IASetIndexBuffer(mesh.indexBuffer.Get(), DXGI_FORMAT_R32_UINT, 0);
+                        context->DrawIndexed(mesh.indexCount, 0, 0);
+                    }
+                    continue;
+                }
+
+                const MeshRenderData* mesh = getMeshRenderData(item.gameObject->GetMeshType());
+                if (mesh == nullptr)
+                {
+                    continue;
+                }
+
+                ObjectBufferData objectData{};
+                XMStoreFloat4x4(&objectData.world, XMMatrixTranspose(item.world));
                 context->UpdateSubresource(objectBuffer.Get(), 0, nullptr, &objectData, 0, 0);
                 context->VSSetConstantBuffers(1, 1, objectBuffer.GetAddressOf());
 
@@ -4593,6 +4918,40 @@ int Run(HINSTANCE instance, int showCommand)
 
             ID3D11ShaderResourceView* nullFsaaSrvs[] = {nullptr};
             context->PSSetShaderResources(0, 1, nullFsaaSrvs);
+        }
+
+        if (runtimeDofEnabled)
+        {
+            ID3D11ShaderResourceView* dofColorInput = activeFsaa ? fsaaShaderResourceView.Get() : gameViewShaderResourceView.Get();
+
+            DofBufferData dofData{};
+            dofData.focusParams = XMFLOAT4(runtimeDofFocusDistance, runtimeDofFocusRange, runtimeDofBlurRadius, 0.0f);
+            dofData.nearFarTexel = XMFLOAT4(
+                cameraNearZ,
+                cameraFarZ,
+                1.0f / static_cast<float>(sceneRenderWidth),
+                1.0f / static_cast<float>(sceneRenderHeight));
+            context->UpdateSubresource(dofBuffer.Get(), 0, nullptr, &dofData, 0, 0);
+
+            ID3D11RenderTargetView* dofTarget = dofRenderTargetView.Get();
+            context->OMSetRenderTargets(1, &dofTarget, nullptr);
+            context->RSSetViewports(1, &sceneViewport);
+            context->IASetInputLayout(nullptr);
+            context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            context->VSSetShader(fxaaVertexShader.Get(), nullptr, 0);
+            context->PSSetShader(dofPixelShader.Get(), nullptr, 0);
+            context->VSSetConstantBuffers(0, 0, nullptr);
+            context->PSSetConstantBuffers(0, 1, dofBuffer.GetAddressOf());
+
+            ID3D11ShaderResourceView* dofInputSrvs[] = {dofColorInput, dofDepthShaderResourceView.Get()};
+            context->PSSetShaderResources(0, 2, dofInputSrvs);
+
+            ID3D11SamplerState* dofSamplers[] = {fsaaSampler.Get()};
+            context->PSSetSamplers(0, 1, dofSamplers);
+            context->Draw(4, 0);
+
+            ID3D11ShaderResourceView* nullDofSrvs[] = {nullptr, nullptr};
+            context->PSSetShaderResources(0, 2, nullDofSrvs);
         }
 
         const float uiClearColor[] = {0.10f, 0.10f, 0.12f, 1.0f};
