@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <shlobj.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <DirectXMath.h>
@@ -528,31 +529,14 @@ std::string ResolveSponzaPath()
     return {};
 }
 
-bool LoadModelFromFile(
+void AppendModelMeshesFromScene(
     ID3D11Device* device,
-    const std::string& modelPath,
-    ModelResource& outModel)
+    const aiScene* scene,
+    const std::filesystem::path& modelDir,
+    ModelResource& outModel,
+    std::unordered_map<std::string, ComPtr<ID3D11ShaderResourceView>>& textureCache)
 {
-    Assimp::Importer importer;
-    const aiScene* scene = importer.ReadFile(
-        modelPath,
-        aiProcess_Triangulate |
-            aiProcess_GenNormals |
-            aiProcess_JoinIdenticalVertices |
-            aiProcess_ImproveCacheLocality |
-            aiProcess_SortByPType);
-
-    if (scene == nullptr || scene->HasMeshes() == false)
-    {
-        return false;
-    }
-
-    const std::filesystem::path modelDir = std::filesystem::path(modelPath).parent_path();
-    std::unordered_map<std::string, ComPtr<ID3D11ShaderResourceView>> textureCache;
-
-    outModel.sourcePath = modelPath;
-    outModel.meshes.clear();
-    outModel.meshes.reserve(scene->mNumMeshes);
+    outModel.meshes.reserve(outModel.meshes.size() + scene->mNumMeshes);
 
     for (unsigned int meshIndex = 0; meshIndex < scene->mNumMeshes; ++meshIndex)
     {
@@ -604,7 +588,7 @@ bool LoadModelFromFile(
 
         if (FAILED(device->CreateBuffer(&vbDesc, &vbData, &mesh.vertexBuffer)))
         {
-            return false;
+            continue;
         }
 
         D3D11_BUFFER_DESC ibDesc{};
@@ -617,7 +601,7 @@ bool LoadModelFromFile(
 
         if (FAILED(device->CreateBuffer(&ibDesc, &ibData, &mesh.indexBuffer)))
         {
-            return false;
+            continue;
         }
 
         if (sourceMesh->mMaterialIndex < scene->mNumMaterials)
@@ -655,6 +639,74 @@ bool LoadModelFromFile(
         }
 
         outModel.meshes.push_back(std::move(mesh));
+    }
+}
+
+bool LoadModelFromFile(
+    ID3D11Device* device,
+    const std::string& modelPath,
+    ModelResource& outModel)
+{
+    Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile(
+        modelPath,
+        aiProcess_Triangulate |
+            aiProcess_GenNormals |
+            aiProcess_JoinIdenticalVertices |
+            aiProcess_ImproveCacheLocality |
+            aiProcess_SortByPType);
+
+    if (scene == nullptr || scene->HasMeshes() == false)
+    {
+        return false;
+    }
+
+    const std::filesystem::path modelDir = std::filesystem::path(modelPath).parent_path();
+    std::unordered_map<std::string, ComPtr<ID3D11ShaderResourceView>> textureCache;
+
+    outModel.sourcePath = modelPath;
+    outModel.meshes.clear();
+    AppendModelMeshesFromScene(device, scene, modelDir, outModel, textureCache);
+
+    return !outModel.meshes.empty();
+}
+
+bool LoadModelFromObjDirectory(
+    ID3D11Device* device,
+    const std::string& directoryPath,
+    ModelResource& outModel)
+{
+    std::vector<std::filesystem::path> objFiles;
+    for (const auto& entry : std::filesystem::directory_iterator(directoryPath))
+    {
+        if (entry.is_regular_file() && entry.path().extension() == ".obj")
+        {
+            objFiles.push_back(entry.path());
+        }
+    }
+    std::sort(objFiles.begin(), objFiles.end());
+
+    outModel.sourcePath = directoryPath;
+    outModel.meshes.clear();
+    std::unordered_map<std::string, ComPtr<ID3D11ShaderResourceView>> textureCache;
+
+    for (const std::filesystem::path& objFile : objFiles)
+    {
+        Assimp::Importer importer;
+        const aiScene* scene = importer.ReadFile(
+            objFile.string(),
+            aiProcess_Triangulate |
+                aiProcess_GenNormals |
+                aiProcess_JoinIdenticalVertices |
+                aiProcess_ImproveCacheLocality |
+                aiProcess_SortByPType);
+
+        if (scene == nullptr || scene->HasMeshes() == false)
+        {
+            continue;
+        }
+
+        AppendModelMeshesFromScene(device, scene, objFile.parent_path(), outModel, textureCache);
     }
 
     return !outModel.meshes.empty();
@@ -2861,6 +2913,31 @@ int Run(HINSTANCE instance, int showCommand)
         return &loadedModels[modelId];
     };
 
+    std::unordered_map<std::string, std::uint32_t> modelPathToId;
+    constexpr std::uint32_t kInvalidModelId = static_cast<std::uint32_t>(-1);
+    auto getOrLoadModelId = [&](const std::string& path) -> std::uint32_t
+    {
+        const auto cached = modelPathToId.find(path);
+        if (cached != modelPathToId.end())
+        {
+            return cached->second;
+        }
+
+        ModelResource model;
+        const bool loaded = std::filesystem::is_directory(path)
+            ? LoadModelFromObjDirectory(device.Get(), path, model)
+            : LoadModelFromFile(device.Get(), path, model);
+        if (!loaded)
+        {
+            return kInvalidModelId;
+        }
+
+        const std::uint32_t modelId = static_cast<std::uint32_t>(loadedModels.size());
+        loadedModels.push_back(std::move(model));
+        modelPathToId[path] = modelId;
+        return modelId;
+    };
+
     const std::string sponzaPath = ResolveSponzaPath();
     if (!sponzaPath.empty())
     {
@@ -2869,6 +2946,7 @@ int Run(HINSTANCE instance, int showCommand)
         {
             const std::uint32_t sponzaModelId = static_cast<std::uint32_t>(loadedModels.size());
             loadedModels.push_back(std::move(sponzaModel));
+            modelPathToId[sponzaPath] = sponzaModelId;
 
             GameObject& sponzaObject = sceneGraph.CreateGameObject("Sponza", MeshType::Model);
             sponzaObject.SetModelId(sponzaModelId);
@@ -3381,6 +3459,8 @@ int Run(HINSTANCE instance, int showCommand)
     float editorInspectorPanelRatio = 0.24f;
     std::uint32_t selectedGameObjectId = groundPlane.GetId();
     std::string currentScenePath;
+    bool pendingSceneLoad = false;
+    std::string pendingSceneLoadPath;
 
     auto showSaveDialog = [window]() -> std::string
     {
@@ -3409,6 +3489,42 @@ int Run(HINSTANCE instance, int showCommand)
         return GetOpenFileNameA(&ofn) ? std::string(fileName) : std::string{};
     };
 
+    auto showOpenModelFileDialog = [window]() -> std::string
+    {
+        char fileName[MAX_PATH]{};
+        OPENFILENAMEA ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner   = window;
+        ofn.lpstrFilter = "Model Files\0*.gltf;*.glb;*.obj;*.fbx\0All Files\0*.*\0";
+        ofn.lpstrFile   = fileName;
+        ofn.nMaxFile    = MAX_PATH;
+        ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        return GetOpenFileNameA(&ofn) ? std::string(fileName) : std::string{};
+    };
+
+    auto showOpenModelFolderDialog = [window]() -> std::string
+    {
+        char displayName[MAX_PATH]{};
+        BROWSEINFOA bi{};
+        bi.hwndOwner = window;
+        bi.pszDisplayName = displayName;
+        bi.lpszTitle = "Select a folder containing OBJ model parts";
+        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+        std::string result;
+        PIDLIST_ABSOLUTE pidl = SHBrowseForFolderA(&bi);
+        if (pidl != nullptr)
+        {
+            char pathBuffer[MAX_PATH]{};
+            if (SHGetPathFromIDListA(pidl, pathBuffer))
+            {
+                result = pathBuffer;
+            }
+            CoTaskMemFree(pidl);
+        }
+        return result;
+    };
+
     auto newScene = [&]()
     {
         sceneGraph.Clear();
@@ -3424,6 +3540,24 @@ int Run(HINSTANCE instance, int showCommand)
         runtimePcssEnabled       = true;
         runtimePcssSearchRadius  = 0.0016f;
         runtimePcssMaxFilterRadius = 0.05f;
+    };
+
+    auto importModelAsObject = [&](const std::string& path)
+    {
+        const std::uint32_t modelId = getOrLoadModelId(path);
+        if (modelId == kInvalidModelId)
+        {
+            return;
+        }
+
+        const std::filesystem::path fsPath(path);
+        const std::string objectName = fsPath.stem().empty() ? fsPath.filename().string() : fsPath.stem().string();
+
+        GameObject& created = sceneGraph.CreateGameObject(objectName, MeshType::Model);
+        created.SetModelId(modelId);
+        created.SetUsesTexture(true);
+        created.SetCastsShadow(true);
+        selectedGameObjectId = created.GetId();
     };
 
     auto saveScene = [&](const std::string& path)
@@ -3466,6 +3600,14 @@ int Run(HINSTANCE instance, int showCommand)
                  << (r.visible      ? 1 : 0) << " "
                  << (r.castsShadow  ? 1 : 0) << "\n";
             file << "OBJECT_NAME "     << go->GetName()    << "\n";
+            if (go->GetMeshType() == MeshType::Model)
+            {
+                const ModelResource* model = getModelById(go->GetModelId());
+                if (model != nullptr)
+                {
+                    file << "OBJECT_MODEL_PATH " << model->sourcePath << "\n";
+                }
+            }
             file << "OBJECT_POSITION " << t.position.x << " " << t.position.y << " " << t.position.z << "\n";
             file << "OBJECT_ROTATION " << t.rotation.x << " " << t.rotation.y << " " << t.rotation.z << "\n";
             file << "OBJECT_SCALE "    << t.scale.x    << " " << t.scale.y    << " " << t.scale.z    << "\n";
@@ -3495,6 +3637,7 @@ int Run(HINSTANCE instance, int showCommand)
             XMFLOAT4 color{1.0f, 1.0f, 1.0f, 1.0f};
             float albedoIntensity = 1.6f;
             std::string texturePath;
+            std::string modelPath;
         };
 
         float newDirYaw          = directionalYaw;
@@ -3562,6 +3705,12 @@ int Run(HINSTANCE instance, int showCommand)
                 if (!current->texturePath.empty() && current->texturePath.front() == ' ')
                     current->texturePath = current->texturePath.substr(1);
             }
+            else if (kw == "OBJECT_MODEL_PATH" && current)
+            {
+                std::getline(ss, current->modelPath);
+                if (!current->modelPath.empty() && current->modelPath.front() == ' ')
+                    current->modelPath = current->modelPath.substr(1);
+            }
         }
 
         // Apply parsed values
@@ -3609,7 +3758,15 @@ int Run(HINSTANCE instance, int showCommand)
                     r.texturePath     = obj->texturePath;
                     if (!r.texturePath.empty())
                         LoadTextureFromImageFile(device.Get(), r.texturePath, r.textureSrv);
-                    created.SetModelId(obj->modelId);
+                    if (obj->meshType == MeshType::Model && !obj->modelPath.empty())
+                    {
+                        const std::uint32_t resolvedModelId = getOrLoadModelId(obj->modelPath);
+                        created.SetModelId(resolvedModelId == kInvalidModelId ? obj->modelId : resolvedModelId);
+                    }
+                    else
+                    {
+                        created.SetModelId(obj->modelId);
+                    }
                     progress = true;
                 }
                 else
@@ -3873,7 +4030,23 @@ int Run(HINSTANCE instance, int showCommand)
                 {
                     const std::string loadPath = showOpenDialog();
                     if (!loadPath.empty())
-                        loadScene(loadPath);
+                    {
+                        pendingSceneLoad = true;
+                        pendingSceneLoadPath = loadPath;
+                    }
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Import Model File..."))
+                {
+                    const std::string modelPath = showOpenModelFileDialog();
+                    if (!modelPath.empty())
+                        importModelAsObject(modelPath);
+                }
+                if (ImGui::MenuItem("Import Model Folder (OBJ parts)..."))
+                {
+                    const std::string modelFolder = showOpenModelFolderDialog();
+                    if (!modelFolder.empty())
+                        importModelAsObject(modelFolder);
                 }
                 ImGui::EndMenu();
             }
@@ -4960,10 +5133,42 @@ int Run(HINSTANCE instance, int showCommand)
         context->RSSetViewports(1, &sceneViewport);
         context->ClearRenderTargetView(backBufferRenderTarget, uiClearColor);
 
+        if (pendingSceneLoad)
+        {
+            const ImGuiIO& io = ImGui::GetIO();
+            const ImVec2 popupSize(320.0f, 80.0f);
+            ImGui::SetNextWindowPos(
+                ImVec2((io.DisplaySize.x - popupSize.x) * 0.5f,
+                       (io.DisplaySize.y - popupSize.y) * 0.5f),
+                ImGuiCond_Always);
+            ImGui::SetNextWindowSize(popupSize, ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.92f);
+            ImGui::Begin("##Loading", nullptr,
+                ImGuiWindowFlags_NoTitleBar |
+                ImGuiWindowFlags_NoResize   |
+                ImGuiWindowFlags_NoMove     |
+                ImGuiWindowFlags_NoCollapse |
+                ImGuiWindowFlags_NoSavedSettings);
+            const int dots = (static_cast<int>(elapsedSeconds * 2.0f) % 4);
+            char loadingText[32]{};
+            std::snprintf(loadingText, sizeof(loadingText), "Loading%.*s", dots, "...");
+            const float textWidth = ImGui::CalcTextSize(loadingText).x;
+            ImGui::SetCursorPosX((popupSize.x - textWidth) * 0.5f);
+            ImGui::SetCursorPosY((popupSize.y - ImGui::GetTextLineHeight()) * 0.5f);
+            ImGui::TextUnformatted(loadingText);
+            ImGui::End();
+        }
+
         ImGui::Render();
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
         swapChain->Present(1, 0);
+
+        if (pendingSceneLoad)
+        {
+            loadScene(pendingSceneLoadPath);
+            pendingSceneLoad = false;
+        }
     }
 
     ImGui_ImplDX11_Shutdown();
