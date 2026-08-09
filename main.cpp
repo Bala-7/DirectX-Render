@@ -59,6 +59,7 @@ struct Vertex
     float position[3];
     float normal[3];
     float uv[2];
+    float uv2[2]; // lightmap UV channel
 };
 
 struct FrameBufferData
@@ -457,6 +458,8 @@ struct ModelMesh
     UINT offset = 0;
     ComPtr<ID3D11ShaderResourceView> texture;
     bool hasTexture = false;
+    ComPtr<ID3D11ShaderResourceView> lightmapSrv;
+    bool hasLightmap = false;
     XMFLOAT4 materialColor = {1.0f, 1.0f, 1.0f, 1.0f};
 };
 
@@ -553,7 +556,8 @@ void AppendModelMeshesFromScene(
             const aiVector3D& p = sourceMesh->mVertices[vertexIndex];
             const aiVector3D n = sourceMesh->HasNormals() ? sourceMesh->mNormals[vertexIndex] : aiVector3D(0.0f, 1.0f, 0.0f);
             const aiVector3D uv = sourceMesh->HasTextureCoords(0) ? sourceMesh->mTextureCoords[0][vertexIndex] : aiVector3D(0.0f, 0.0f, 0.0f);
-            vertices[vertexIndex] = {{p.x, p.y, p.z}, {n.x, n.y, n.z}, {uv.x, uv.y}};
+            const aiVector3D uv2 = sourceMesh->HasTextureCoords(1) ? sourceMesh->mTextureCoords[1][vertexIndex] : aiVector3D(0.0f, 0.0f, 0.0f);
+            vertices[vertexIndex] = {{p.x, p.y, p.z}, {n.x, n.y, n.z}, {uv.x, uv.y}, {uv2.x, uv2.y}};
         }
 
         std::vector<std::uint32_t> indices;
@@ -613,26 +617,38 @@ void AppendModelMeshesFromScene(
                 material->Get(AI_MATKEY_COLOR_DIFFUSE, diffuse);
                 mesh.materialColor = XMFLOAT4(diffuse.r, diffuse.g, diffuse.b, 1.0f);
 
+                auto cacheLoad = [&](const std::string& file, ComPtr<ID3D11ShaderResourceView>& outSrv) -> bool
+                {
+                    const auto it = textureCache.find(file);
+                    if (it != textureCache.end()) { outSrv = it->second; return true; }
+                    if (LoadTextureFromImageFile(device, file, outSrv)) { textureCache[file] = outSrv; return true; }
+                    return false;
+                };
+
                 aiString texturePath;
                 if (material->GetTexture(aiTextureType_DIFFUSE, 0, &texturePath) == AI_SUCCESS)
                 {
                     const std::filesystem::path fullPath = modelDir / texturePath.C_Str();
-                    const std::string textureFile = fullPath.string();
-                    const auto textureIt = textureCache.find(textureFile);
-                    if (textureIt != textureCache.end())
+                    const std::string stem = fullPath.stem().string();
+                    const bool isLightmapTex = stem.size() >= 2 && stem.substr(stem.size() - 2) == "_L";
+
+                    if (isLightmapTex)
                     {
-                        mesh.texture = textureIt->second;
-                        mesh.hasTexture = true;
+                        const std::filesystem::path basePath = fullPath.parent_path() /
+                            (stem.substr(0, stem.size() - 2) + fullPath.extension().string());
+                        if (std::filesystem::exists(basePath) && cacheLoad(basePath.string(), mesh.texture))
+                        {
+                            mesh.hasTexture = true;
+                            mesh.hasLightmap = cacheLoad(fullPath.string(), mesh.lightmapSrv);
+                        }
+                        else
+                        {
+                            mesh.hasTexture = cacheLoad(fullPath.string(), mesh.texture);
+                        }
                     }
                     else
                     {
-                        ComPtr<ID3D11ShaderResourceView> textureSrv;
-                        if (LoadTextureFromImageFile(device, textureFile, textureSrv))
-                        {
-                            textureCache[textureFile] = textureSrv;
-                            mesh.texture = textureSrv;
-                            mesh.hasTexture = true;
-                        }
+                        mesh.hasTexture = cacheLoad(fullPath.string(), mesh.texture);
                     }
                 }
             }
@@ -1551,6 +1567,7 @@ int Run(HINSTANCE instance, int showCommand)
             float3 position : POSITION;
             float3 normal : NORMAL;
             float2 uv : TEXCOORD0;
+            float2 uv2 : TEXCOORD1;
         };
 
         struct VSOutput
@@ -1562,6 +1579,7 @@ int Run(HINSTANCE instance, int showCommand)
             float4 shadowPosition0 : TEXCOORD3;
             float4 shadowPosition1 : TEXCOORD4;
             float4 shadowPosition2 : TEXCOORD5;
+            float2 uv2 : TEXCOORD6;
         };
 
         VSOutput main(VSInput input)
@@ -1572,6 +1590,7 @@ int Run(HINSTANCE instance, int showCommand)
             output.worldPosition = worldPosition.xyz;
             output.worldNormal = normalize(mul(float4(input.normal, 0.0f), worldInverseTranspose).xyz);
             output.uv = input.uv;
+            output.uv2 = input.uv2;
             output.shadowPosition0 = mul(worldPosition, lightViewProjection0);
             output.shadowPosition1 = mul(worldPosition, lightViewProjection1);
             output.shadowPosition2 = mul(worldPosition, lightViewProjection2);
@@ -1584,6 +1603,7 @@ int Run(HINSTANCE instance, int showCommand)
         Texture2D shadowMap0 : register(t1);
         Texture2D shadowMap1 : register(t2);
         Texture2D shadowMap2 : register(t3);
+        Texture2D lightmapTexture : register(t4);
 
         SamplerState textureSampler : register(s0);
         SamplerComparisonState shadowSampler : register(s1);
@@ -1640,6 +1660,7 @@ int Run(HINSTANCE instance, int showCommand)
             float4 shadowPosition0 : TEXCOORD3;
             float4 shadowPosition1 : TEXCOORD4;
             float4 shadowPosition2 : TEXCOORD5;
+            float2 uv2 : TEXCOORD6;
         };
 
         float ComputeShadow(Texture2D shadowMap, float4 shadowPosition, float shadowBias)
@@ -1729,7 +1750,12 @@ int Run(HINSTANCE instance, int showCommand)
 
             float useTexture = materialParams.x;
             float albedoIntensity = materialParams.y;
+            float hasLightmap = materialParams.z;
             float3 sampledAlbedo = baseTexture.Sample(textureSampler, input.uv).rgb;
+            if (hasLightmap > 0.5f)
+            {
+                sampledAlbedo *= lightmapTexture.Sample(textureSampler, input.uv2).rgb;
+            }
             float3 albedo = lerp(materialColor.rgb, sampledAlbedo, useTexture) * albedoIntensity;
 
             float specularPower = lightingParams.x;
@@ -1768,11 +1794,15 @@ int Run(HINSTANCE instance, int showCommand)
             float specular1 = pow(max(dot(viewDirection, reflection1), 0.0f), specularPower);
             totalLight += ((diffuse1 * albedo) + specular1.xxx) * lightColor1.rgb * lightColor1.a * attenuation1 * rangeFade1 * rangeFade1 * spotFactor1 * shadow1;
 
-            float3 directionalToLight = normalize(-directionalLightDirection.xyz);
-            float diffuseDirectional = max(dot(normal, directionalToLight), 0.0f);
-            float3 reflectionDirectional = reflect(-directionalToLight, normal);
-            float specularDirectional = pow(max(dot(viewDirection, reflectionDirectional), 0.0f), specularPower);
-            totalLight += ((diffuseDirectional * albedo) + specularDirectional.xxx) * directionalLightColor.rgb * directionalLightColor.a * shadow2;
+            // Lightmapped surfaces skip the directional light: baked lighting already encodes it
+            if (hasLightmap <= 0.5f)
+            {
+                float3 directionalToLight = normalize(-directionalLightDirection.xyz);
+                float diffuseDirectional = max(dot(normal, directionalToLight), 0.0f);
+                float3 reflectionDirectional = reflect(-directionalToLight, normal);
+                float specularDirectional = pow(max(dot(viewDirection, reflectionDirectional), 0.0f), specularPower);
+                totalLight += ((diffuseDirectional * albedo) + specularDirectional.xxx) * directionalLightColor.rgb * directionalLightColor.a * shadow2;
+            }
 
             int numPointLights = (int)pointLightParams.x;
             for (int i = 0; i < numPointLights; ++i)
@@ -2657,6 +2687,7 @@ int Run(HINSTANCE instance, int showCommand)
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 32, D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
 
     ComPtr<ID3D11InputLayout> inputLayout;
@@ -4823,8 +4854,9 @@ int Run(HINSTANCE instance, int showCommand)
             nullptr,
             shadowShaderViews[0].Get(),
             shadowShaderViews[1].Get(),
-            shadowShaderViews[2].Get()};
-        context->PSSetShaderResources(0, 4, sceneSrvs);
+            shadowShaderViews[2].Get(),
+            nullptr};
+        context->PSSetShaderResources(0, 5, sceneSrvs);
 
         ID3D11SamplerState* samplers[] = {textureSampler.Get(), shadowSampler.Get(), shadowDepthSampler.Get()};
         context->PSSetSamplers(0, 3, samplers);
@@ -4850,15 +4882,16 @@ int Run(HINSTANCE instance, int showCommand)
                     objectData.materialParams = XMFLOAT4(
                         mesh.hasTexture ? 1.0f : 0.0f,
                         item.gameObject->GetRenderer().albedoIntensity,
-                        0.0f,
+                        mesh.hasLightmap ? 1.0f : 0.0f,
                         0.0f);
 
                     ID3D11ShaderResourceView* drawSrvs[] = {
                         mesh.hasTexture && mesh.texture ? mesh.texture.Get() : nullptr,
                         shadowShaderViews[0].Get(),
                         shadowShaderViews[1].Get(),
-                        shadowShaderViews[2].Get()};
-                    context->PSSetShaderResources(0, 4, drawSrvs);
+                        shadowShaderViews[2].Get(),
+                        mesh.hasLightmap && mesh.lightmapSrv ? mesh.lightmapSrv.Get() : nullptr};
+                    context->PSSetShaderResources(0, 5, drawSrvs);
 
                     context->UpdateSubresource(objectBuffer.Get(), 0, nullptr, &objectData, 0, 0);
                     context->VSSetConstantBuffers(1, 1, objectBuffer.GetAddressOf());
@@ -4896,8 +4929,9 @@ int Run(HINSTANCE instance, int showCommand)
                 useTexForPrim ? primTexSrv : nullptr,
                 shadowShaderViews[0].Get(),
                 shadowShaderViews[1].Get(),
-                shadowShaderViews[2].Get()};
-            context->PSSetShaderResources(0, 4, primSrvs);
+                shadowShaderViews[2].Get(),
+                nullptr};
+            context->PSSetShaderResources(0, 5, primSrvs);
 
             context->UpdateSubresource(objectBuffer.Get(), 0, nullptr, &objectData, 0, 0);
             context->VSSetConstantBuffers(1, 1, objectBuffer.GetAddressOf());
